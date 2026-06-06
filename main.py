@@ -538,7 +538,7 @@ class MerchantNotifyPlugin(Star):
         status_names = {0: "不@全员", 1: "@全员"}
         yield event.plain_result(f"✅ 设置成功！当前群聊的艾特状态已修改为：【{status_names[status_int]}】")
 
-    @command("商人")
+    @command("远行商人")
     async def manual_check(self, event: AstrMessageEvent):
         """机器人快捷指令：手动触发并获取当前商品列表"""
         try:
