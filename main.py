@@ -467,7 +467,27 @@ class MerchantNotifyPlugin(Star):
                 "- /设置商人艾特 [0/1]"
             )
         else:
-            yield event.plain_result("⚠️ 当前位置已经订阅过了，无需重复订阅。")
+            settings = self.subscribers[umo]
+            push_mode = settings.get("push_mode", 1)
+            mention_everyone = settings.get("mention_everyone", 0)
+            
+            push_mode_names = {0: "全部推送", 1: "只匹配到商品推送", 2: "完全不推送"}
+            mention_names = {0: "不@全员", 1: "@全员"}
+            
+            yield event.plain_result(
+                "⚠️ 当前位置已经订阅过了，无需重复订阅。\n\n"
+                f"💡 当前群聊推送规则：\n"
+                f"- 推送模式：【{push_mode}】{push_mode_names.get(push_mode, '未知')}\n"
+                f"- 艾特模式：【{mention_everyone}】{mention_names.get(mention_everyone, '未知')}\n\n"
+                "⚙️ 群内可用管理指令：\n"
+                "- /设置商人推送 [0/1/2]\n"
+                "  0 -> 全部推送\n"
+                "  1 -> 只匹配到商品推送\n"
+                "  2 -> 完全不推送\n"
+                "- /设置商人艾特 [0/1]\n"
+                "  0 -> 不@全员\n"
+                "  1 -> @全员"
+            )
 
     @command("取消订阅商人")
     async def unsubscribe(self, event: AstrMessageEvent):
