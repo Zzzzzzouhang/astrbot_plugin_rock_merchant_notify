@@ -1,0 +1,17 @@
+{
+  "merchant_url": {
+    "description": "远行商人页面源地址",
+    "type": "string",
+    "default": "https://www.onebiji.com/hykb_tools/comm/lkwgmerchant/preview.php?id=1&immgj=0"
+  },
+  "refresh_times": {
+    "description": "每天刷新的时间点 (逗号分隔)",
+    "type": "string",
+    "default": "08:01,12:01,16:01,20:01"
+  },
+  "watch_items": {
+    "description": "重点关注的商品名称 (逗号分隔)",
+    "type": "string",
+    "default": "国王球,棱镜球,炫彩精灵蛋,祝福吊坠"
+  }
+}
