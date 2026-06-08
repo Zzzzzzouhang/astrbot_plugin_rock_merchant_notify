@@ -311,28 +311,28 @@ class MerchantNotifyPlugin(Star):
                     logging.error(f"[{self.name}] 读取历史记录失败: {e}")
             
             history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
-            history_lines = history_lines[-20:]
-            
+            history_lines = history_lines[-1000:]
+
             try:
                 with self.history_path.open("w", encoding="utf-8") as fp:
                     fp.writelines(history_lines)
             except Exception as e:
                 logging.error(f"[{self.name}] 写入历史记录失败: {e}")
-            
+
             # 分发推送
             if send_alert and self.subscribers:
                 logging.info(f"[{self.name}] 检测到数据更新，开始处理分群过滤推送...")
                 for umo, settings in self.subscribers.items():
                     push_mode = settings.get("push_mode", 1)
                     mention_everyone = settings.get("mention_everyone", 0)
-                    
+
                     should_push = False
-                    if push_mode == 0:     
+                    if push_mode == 0:
                         should_push = True
-                    elif push_mode == 1:   
+                    elif push_mode == 1:
                         if matched:
                             should_push = True
-                    
+
                     if should_push:
                         try:
                             chain = MessageChain()
@@ -343,7 +343,7 @@ class MerchantNotifyPlugin(Star):
                             asyncio.create_task(self.context.send_message(umo, chain))
                         except Exception as e:
                             logging.error(f"[{self.name}] 向 {umo} 推送失败: {e}")
-        
+
         return full_text
 
     async def execute_check(self, send_alert: bool) -> tuple[str, bool]:
@@ -412,28 +412,28 @@ class MerchantNotifyPlugin(Star):
                     logging.error(f"[{self.name}] 读取历史记录失败: {e}")
             
             history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
-            history_lines = history_lines[-20:]
-            
+            history_lines = history_lines[-1000:]
+
             try:
                 with self.history_path.open("w", encoding="utf-8") as fp:
                     fp.writelines(history_lines)
             except Exception as e:
                 logging.error(f"[{self.name}] 写入历史记录失败: {e}")
-            
+
             # 分发推送
             if send_alert and self.subscribers:
                 logging.info(f"[{self.name}] 检测到数据更新，开始处理分群过滤推送...")
                 for umo, settings in self.subscribers.items():
                     push_mode = settings.get("push_mode", 1)
                     mention_everyone = settings.get("mention_everyone", 0)
-                    
+
                     should_push = False
-                    if push_mode == 0:     
+                    if push_mode == 0:
                         should_push = True
-                    elif push_mode == 1:   
+                    elif push_mode == 1:
                         if matched:
                             should_push = True
-                    
+
                     if should_push:
                         try:
                             chain = MessageChain()
@@ -444,7 +444,7 @@ class MerchantNotifyPlugin(Star):
                             asyncio.create_task(self.context.send_message(umo, chain))
                         except Exception as e:
                             logging.error(f"[{self.name}] 向 {umo} 推送失败: {e}")
-        
+
         return full_text, changed
 
     @command("订阅商人")
@@ -547,3 +547,52 @@ class MerchantNotifyPlugin(Star):
             yield event.plain_result(result_msg)
         except Exception as e:
             yield event.plain_result(f"查询失败: {str(e)}")
+
+    @command("商人历史")
+    async def merchant_history(self, event: AstrMessageEvent):
+        """查看远行商人历史刷新记录（最近 15 条）"""
+        if not self.history_path.exists():
+            yield event.plain_result("⚠️ 暂无历史记录。")
+            return
+
+        try:
+            with self.history_path.open("r", encoding="utf-8") as fp:
+                history_lines = fp.readlines()
+        except Exception as e:
+            logging.error(f"[{self.name}] 读取历史记录失败: {e}")
+            yield event.plain_result(f"查询失败: {str(e)}")
+            return
+
+        if not history_lines:
+            yield event.plain_result("⚠️ 暂无历史记录。")
+            return
+
+        # 取最近 15 条
+        recent_lines = history_lines[-15:]
+
+        lines = []
+        for line in recent_lines:
+            try:
+                entry = json.loads(line)
+                fetched_at = entry.get("fetched_at", "")
+                items = entry.get("items", [])
+                item_names = [item.get("name", "") for item in items if item.get("name")]
+
+                # 格式化检查时间
+                try:
+                    display_time = datetime.fromisoformat(fetched_at)
+                    time_str = display_time.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    time_str = fetched_at or "未知时间"
+
+                lines.append(f"[{time_str}] [{', '.join(item_names) if item_names else '空'}]")
+            except Exception as e:
+                logging.error(f"[{self.name}] 解析历史记录失败: {e}")
+                continue
+
+        if not lines:
+            yield event.plain_result("⚠️ 历史记录解析失败。")
+            return
+
+        result = "📜 远行商人历史记录（最近 15 条）：\n\n" + "\n".join(lines)
+        yield event.plain_result(result)
