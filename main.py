@@ -110,6 +110,9 @@ def has_changed(previous: dict[str, Any] | None, current: dict[str, Any]) -> boo
 
 @register("astrbot_plugin_rock_merchant_notify", "AstrBot", "远行商人监控插件", "1.3.0", "支持不同群聊独立配置推送模式及艾特规则")
 class MerchantNotifyPlugin(Star):
+    # 统一追加在所有回复末尾的指令提示
+    HINT_LINE = "\n💡 /远行商人 /「取消」订阅商人  /商人历史"
+
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
@@ -145,6 +148,14 @@ class MerchantNotifyPlugin(Star):
 
     def _save_subscribers(self):
         self.subscribers_path.write_text(json.dumps(self.subscribers, ensure_ascii=False), encoding="utf-8")
+
+    def _check_admin(self, event: AstrMessageEvent) -> bool:
+        """管理指令权限校验：群聊仅管理员/群主可用，私聊直接放行"""
+        # 私聊直接放行
+        if not event.get_group_id():
+            return True
+        # 群聊：检查是否是管理员或群主
+        return event.is_admin()
 
     def get_watch_items(self) -> list[str]:
         raw = self.config.get("watch_items", "国王球,棱镜球,炫彩蛋,炫彩精灵蛋,祝福吊坠")
@@ -450,6 +461,9 @@ class MerchantNotifyPlugin(Star):
     @command("订阅商人")
     async def subscribe(self, event: AstrMessageEvent):
         """订阅远行商人刷新自动推送"""
+        if not self._check_admin(event):
+            yield event.plain_result("🔒 此指令仅限群管理员/群主使用，私聊无限制。" + self.HINT_LINE)
+            return
         umo = event.unified_msg_origin
         if umo not in self.subscribers:
             self.subscribers[umo] = {
@@ -465,6 +479,7 @@ class MerchantNotifyPlugin(Star):
                 "⚙️ 群内可用管理指令：\n"
                 "- /设置商人推送 [0/1/2]\n"
                 "- /设置商人艾特 [0/1]"
+                + self.HINT_LINE
             )
         else:
             settings = self.subscribers[umo]
@@ -487,29 +502,36 @@ class MerchantNotifyPlugin(Star):
                 "- /设置商人艾特 [0/1]\n"
                 "  0 -> 不@全员\n"
                 "  1 -> @全员"
+                + self.HINT_LINE
             )
 
     @command("取消订阅商人")
     async def unsubscribe(self, event: AstrMessageEvent):
         """取消订阅远行商人刷新推送"""
+        if not self._check_admin(event):
+            yield event.plain_result("🔒 此指令仅限群管理员/群主使用，私聊无限制。" + self.HINT_LINE)
+            return
         umo = event.unified_msg_origin
         if umo in self.subscribers:
             del self.subscribers[umo]
             self._save_subscribers()
-            yield event.plain_result("✅ 已取消订阅，本窗口不再接收商人刷新推送。")
+            yield event.plain_result("✅ 已取消订阅，本窗口不再接收商人刷新推送。" + self.HINT_LINE)
         else:
-            yield event.plain_result("⚠️ 当前位置尚未订阅。")
+            yield event.plain_result("⚠️ 当前位置尚未订阅。" + self.HINT_LINE)
 
     @command("设置商人推送")
     async def set_push_mode(self, event: AstrMessageEvent, mode: str):
         """【分群配置】设置当前群聊的推送模式"""
+        if not self._check_admin(event):
+            yield event.plain_result("🔒 此指令仅限群管理员/群主使用，私聊无限制。" + self.HINT_LINE)
+            return
         umo = event.unified_msg_origin
         if umo not in self.subscribers:
-            yield event.plain_result("⚠️ 当前群聊尚未订阅商人推送，请先发送 /订阅商人")
+            yield event.plain_result("⚠️ 当前群聊尚未订阅商人推送，请先发送 /订阅商人" + self.HINT_LINE)
             return
 
         if mode not in ["0", "1", "2"]:
-            yield event.plain_result("❌ 参数错误！请输入规范的参数：\n0 -> 全部推送\n1 -> 只匹配到商品推送\n2 -> 完全不推送")
+            yield event.plain_result("❌ 参数错误！请输入规范的参数：\n0 -> 全部推送\n1 -> 只匹配到商品推送\n2 -> 完全不推送" + self.HINT_LINE)
             return
 
         mode_int = int(mode)
@@ -517,18 +539,21 @@ class MerchantNotifyPlugin(Star):
         self._save_subscribers()
 
         mode_names = {0: "全部推送", 1: "只匹配到商品推送", 2: "完全不推送"}
-        yield event.plain_result(f"✅ 设置成功！当前群聊的推送模式已修改为：【{mode_names[mode_int]}】")
+        yield event.plain_result(f"✅ 设置成功！当前群聊的推送模式已修改为：【{mode_names[mode_int]}】" + self.HINT_LINE)
 
     @command("设置商人艾特")
     async def set_mention_everyone(self, event: AstrMessageEvent, status: str):
         """【分群配置】设置推送时是否@全员"""
+        if not self._check_admin(event):
+            yield event.plain_result("🔒 此指令仅限群管理员/群主使用，私聊无限制。" + self.HINT_LINE)
+            return
         umo = event.unified_msg_origin
         if umo not in self.subscribers:
-            yield event.plain_result("⚠️ 当前群聊尚未订阅商人推送，请先发送 /订阅商人")
+            yield event.plain_result("⚠️ 当前群聊尚未订阅商人推送，请先发送 /订阅商人" + self.HINT_LINE)
             return
 
         if status not in ["0", "1"]:
-            yield event.plain_result("❌ 参数错误！请输入规范的参数：\n0 -> 不@全员\n1 -> @全员")
+            yield event.plain_result("❌ 参数错误！请输入规范的参数：\n0 -> 不@全员\n1 -> @全员" + self.HINT_LINE)
             return
 
         status_int = int(status)
@@ -536,7 +561,7 @@ class MerchantNotifyPlugin(Star):
         self._save_subscribers()
 
         status_names = {0: "不@全员", 1: "@全员"}
-        yield event.plain_result(f"✅ 设置成功！当前群聊的艾特状态已修改为：【{status_names[status_int]}】")
+        yield event.plain_result(f"✅ 设置成功！当前群聊的艾特状态已修改为：【{status_names[status_int]}】" + self.HINT_LINE)
 
     @command("远行商人")
     async def manual_check(self, event: AstrMessageEvent):
@@ -544,15 +569,15 @@ class MerchantNotifyPlugin(Star):
         try:
             # 手动执行不走轮询次数限制，也默认不发全群广播，仅回复当前用户
             result_msg, _ = await self.execute_check(send_alert=False)
-            yield event.plain_result(result_msg)
+            yield event.plain_result(result_msg + self.HINT_LINE)
         except Exception as e:
-            yield event.plain_result(f"查询失败: {str(e)}")
+            yield event.plain_result(f"查询失败: {str(e)}" + self.HINT_LINE)
 
     @command("商人历史")
     async def merchant_history(self, event: AstrMessageEvent):
         """查看远行商人历史刷新记录（最近 15 条）"""
         if not self.history_path.exists():
-            yield event.plain_result("⚠️ 暂无历史记录。")
+            yield event.plain_result("⚠️ 暂无历史记录。" + self.HINT_LINE)
             return
 
         try:
@@ -560,11 +585,11 @@ class MerchantNotifyPlugin(Star):
                 history_lines = fp.readlines()
         except Exception as e:
             logging.error(f"[{self.name}] 读取历史记录失败: {e}")
-            yield event.plain_result(f"查询失败: {str(e)}")
+            yield event.plain_result(f"查询失败: {str(e)}" + self.HINT_LINE)
             return
 
         if not history_lines:
-            yield event.plain_result("⚠️ 暂无历史记录。")
+            yield event.plain_result("⚠️ 暂无历史记录。" + self.HINT_LINE)
             return
 
         # 取最近 15 条
@@ -591,8 +616,8 @@ class MerchantNotifyPlugin(Star):
                 continue
 
         if not lines:
-            yield event.plain_result("⚠️ 历史记录解析失败。")
+            yield event.plain_result("⚠️ 历史记录解析失败。" + self.HINT_LINE)
             return
 
         result = "📜 远行商人历史记录（最近 15 条）：\n\n" + "\n".join(lines)
-        yield event.plain_result(result)
+        yield event.plain_result(result + self.HINT_LINE)
