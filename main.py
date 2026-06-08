@@ -147,7 +147,7 @@ class MerchantNotifyPlugin(Star):
         self.subscribers_path.write_text(json.dumps(self.subscribers, ensure_ascii=False), encoding="utf-8")
 
     def get_watch_items(self) -> list[str]:
-        raw = self.config.get("watch_items", "国王球,棱镜球,炫彩精灵蛋,祝福吊坠")
+        raw = self.config.get("watch_items", "国王球,棱镜球,炫彩蛋,炫彩精灵蛋,祝福吊坠")
         return [i.strip() for i in raw.split(",") if i.strip()]
 
     def get_active_slot(self, current_time: datetime) -> str | None:
