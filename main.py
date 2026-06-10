@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,26 @@ from bs4 import BeautifulSoup
 from astrbot.api.all import Star, Context, register, command, AstrMessageEvent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.api.event import MessageChain
+
+
+def _setup_file_logger(name: str, log_path: Path) -> logging.Logger:
+    """为插件配置独立的文件日志，同时保留控制台输出。"""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    # 避免重复添加 handler
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "_plugin_log", False) for h in logger.handlers):
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh._plugin_log = True  # type: ignore[attr-defined]
+        fh.setLevel(logging.DEBUG)
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+    return logger
 
 # ==================== 原版核心解析逻辑 ====================
 
@@ -121,9 +142,12 @@ class MerchantNotifyPlugin(Star):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.data_dir / "latest.json"
         self.history_path = self.data_dir / "history.jsonl"
-        self.subscribers_path = self.data_dir / "subscribers.json" 
+        self.subscribers_path = self.data_dir / "subscribers.json"
+        self.log_path = self.data_dir / "merchant.log"
         self.timezone = "Asia/Shanghai"
-        
+
+        self.logger = _setup_file_logger(self.name, self.log_path)
+
         self.subscribers = self._load_subscribers()
         
         # 新增：用于控制单次时间窗口内抓取频次的状态变量
@@ -143,7 +167,7 @@ class MerchantNotifyPlugin(Star):
                     return {umo: {"push_mode": 1, "mention_everyone": 0} for umo in data}
                 return data
             except Exception as e:
-                logging.error(f"[{self.name}] 读取订阅列表失败: {e}")
+                self.logger.error(f"读取订阅列表失败: {e}")
         return {}
 
     def _save_subscribers(self):
@@ -187,9 +211,11 @@ class MerchantNotifyPlugin(Star):
             try:
                 current_time = datetime.now(ZoneInfo(self.timezone))
                 active_slot = self.get_active_slot(current_time)
-                
+
                 if not active_slot:
                     # 不在任何窗口期，清理状态并保持沉睡
+                    if self.current_active_slot is not None:
+                        self.logger.info(f"窗口期结束，清理轮询状态")
                     self.current_active_slot = None
                     self.attempt_count = 0
                     self.slot_success = False
@@ -201,41 +227,45 @@ class MerchantNotifyPlugin(Star):
                         self.attempt_count = 0
                         self.slot_success = False
                         self.last_fetch_result = None
-                    
+                        self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
+
                     # 只有在未获取到新数据，且尝试次数没超限时，才执行抓取
                     if not self.slot_success and self.attempt_count < 5:
                         self.attempt_count += 1
-                        logging.info(f"[{self.name}] 正在执行 {active_slot} 窗口期的第 {self.attempt_count}/5 次抓取检测...")
-                        
+                        self.logger.info(f"正在执行 {active_slot} 窗口期的第 {self.attempt_count}/5 次抓取检测...")
+
                         # 执行抓取但不立即推送，仅获取数据
                         current_payload, _ = await self.execute_fetch_only()
-                        
+
                         # 第一次抓取：保存结果，继续下一次
                         if self.attempt_count == 1:
                             self.last_fetch_result = current_payload
-                            logging.info(f"[{self.name}] {active_slot} 第1次抓取完成，等待下次抓取比对...")
+                            self.logger.info(f"{active_slot} 第1次抓取完成，等待下次抓取比对...")
                         else:
                             # 第二次及以后：与上一次结果比较
                             if comparable_payload(self.last_fetch_result) == comparable_payload(current_payload):
-                                # 两次结果一致，使用上一次保存的状态判断是否需要推送
-                                await self.process_and_push(current_payload, send_alert=True)
+                                # 两次结果一致，说明网页已稳定，强制推送
+                                # 轮询确认的新窗口数据，应当视为有效变更
+                                self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
+                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
                                 self.slot_success = True
-                                logging.info(f"[{self.name}] {active_slot} 连续两次抓取结果一致！推送完毕，本窗口期不再继续抓取。")
+                                self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
                             else:
                                 # 结果不一致，更新缓存继续抓取
                                 self.last_fetch_result = current_payload
-                                logging.info(f"[{self.name}] {active_slot} 第 {self.attempt_count} 次抓取结果与上次不一致，继续比对...")
-                            
+                                self.logger.info(f"{active_slot} 第 {self.attempt_count} 次抓取结果与上次不一致，继续比对...")
+
                             # 达到最大次数兜底
                             if self.attempt_count >= 5 and not self.slot_success:
                                 # 使用最后一次结果推送
-                                await self.process_and_push(current_payload, send_alert=True)
+                                self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送")
+                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
                                 self.slot_success = True
-                                logging.info(f"[{self.name}] {active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送，本窗口期不再继续抓取。")
+                                self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
 
             except Exception as e:
-                logging.error(f"[{self.name}] Polling error: {e}")
-            
+                self.logger.error(f"Polling error: {e}", exc_info=True)
+
             # 基础周期改为2分钟
             await asyncio.sleep(120)
 
@@ -268,20 +298,26 @@ class MerchantNotifyPlugin(Star):
         
         return payload, changed
 
-    async def process_and_push(self, payload: dict[str, Any], send_alert: bool) -> str:
-        """处理抓取结果，保存状态并推送通知"""
+    async def process_and_push(self, payload: dict[str, Any], send_alert: bool, force_save: bool = False) -> str:
+        """处理抓取结果，保存状态并推送通知
+
+        Args:
+            payload: 当前抓取的数据。
+            send_alert: 是否向订阅者发送推送。
+            force_save: 是否强制保存状态和写入历史（用于轮询确认新窗口数据）。
+        """
         current_time = datetime.now(ZoneInfo(self.timezone))
-        
+
         # 读取上次保存的状态
         previous = None
         if self.state_path.exists():
             try:
                 previous = json.loads(self.state_path.read_text(encoding="utf-8"))
             except Exception as e:
-                logging.error(f"[{self.name}] 读取历史状态失败: {e}")
+                self.logger.error(f"读取历史状态失败: {e}")
 
         changed = has_changed(previous, payload)
-        
+
         # 判断时间兜底
         if not changed and previous and "fetched_at" in previous:
             try:
@@ -290,13 +326,13 @@ class MerchantNotifyPlugin(Star):
                 display_time = current_time
         else:
             display_time = current_time
-        
+
         watch_items = self.get_watch_items()
         matched = [item["name"] for item in payload["items"] if item["name"] in watch_items]
-        
+
         slot_label = payload["slot"]["label"]
         title = f"远行商人已刷新 {slot_label}" if not matched else f"远行商人命中关注商品 {slot_label}"
-        
+
         lines = []
         if matched:
             lines.append(f"🎯 关注商品：{', '.join(matched)}\n")
@@ -304,23 +340,23 @@ class MerchantNotifyPlugin(Star):
             price = item["price_text"] or "未知价格"
             limit = item["limit_text"] or "限购未知"
             lines.append(f"{item['slot']}. {item['name']} | {price} | {limit}")
-            
+
         message = "\n".join(lines)
         time_str = display_time.strftime("%Y-%m-%d %H:%M")
         full_text = f"【{title}】\n{message}\n\n🕒 检查时间：{time_str}"
 
-        # 状态发生变化时保存数据
-        if changed:
+        # 状态发生变化，或强制保存时，保存数据
+        if changed or force_save:
             self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            
+
             history_lines = []
             if self.history_path.exists():
                 try:
                     with self.history_path.open("r", encoding="utf-8") as fp:
                         history_lines = fp.readlines()
                 except Exception as e:
-                    logging.error(f"[{self.name}] 读取历史记录失败: {e}")
-            
+                    self.logger.error(f"读取历史记录失败: {e}")
+
             history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
             history_lines = history_lines[-1000:]
 
@@ -328,11 +364,11 @@ class MerchantNotifyPlugin(Star):
                 with self.history_path.open("w", encoding="utf-8") as fp:
                     fp.writelines(history_lines)
             except Exception as e:
-                logging.error(f"[{self.name}] 写入历史记录失败: {e}")
+                self.logger.error(f"写入历史记录失败: {e}")
 
             # 分发推送
             if send_alert and self.subscribers:
-                logging.info(f"[{self.name}] 检测到数据更新，开始处理分群过滤推送...")
+                self.logger.info(f"检测到数据更新，开始处理分群过滤推送...")
                 for umo, settings in self.subscribers.items():
                     push_mode = settings.get("push_mode", 1)
                     mention_everyone = settings.get("mention_everyone", 0)
@@ -352,37 +388,38 @@ class MerchantNotifyPlugin(Star):
                             chain.message(full_text)
                             # 使用 asyncio.create_task 避免单一群聊发送卡死阻塞总流程
                             asyncio.create_task(self.context.send_message(umo, chain))
+                            self.logger.info(f"已向 {umo} 发送推送")
                         except Exception as e:
-                            logging.error(f"[{self.name}] 向 {umo} 推送失败: {e}")
+                            self.logger.error(f"向 {umo} 推送失败: {e}")
 
         return full_text
 
     async def execute_check(self, send_alert: bool) -> tuple[str, bool]:
         """执行抓取流程并推送，返回值 -> (拼接好的消息文本, 数据是否变更)"""
         current_time = datetime.now(ZoneInfo(self.timezone))
-        
+
         url = self.config.get("merchant_url", "")
         if not url:
             return "配置错误：未提供 merchant_url", False
 
         html = await asyncio.to_thread(fetch_page, url)
         parsed = await asyncio.to_thread(parse_items, html)
-        
+
         payload = {
             "fetched_at": current_time.isoformat(),
             "slot": parsed["slot"],
             "items": parsed["items"],
         }
-        
+
         previous = None
         if self.state_path.exists():
             try:
                 previous = json.loads(self.state_path.read_text(encoding="utf-8"))
             except Exception as e:
-                logging.error(f"[{self.name}] 读取历史状态失败: {e}")
+                self.logger.error(f"读取历史状态失败: {e}")
 
         changed = has_changed(previous, payload)
-        
+
         # 判断时间兜底
         if not changed and previous and "fetched_at" in previous:
             try:
@@ -391,13 +428,13 @@ class MerchantNotifyPlugin(Star):
                 display_time = current_time
         else:
             display_time = current_time
-        
+
         watch_items = self.get_watch_items()
         matched = [item["name"] for item in payload["items"] if item["name"] in watch_items]
-        
+
         slot_label = payload["slot"]["label"]
         title = f"远行商人已刷新 {slot_label}" if not matched else f"远行商人命中关注商品 {slot_label}"
-        
+
         lines = []
         if matched:
             lines.append(f"🎯 关注商品：{', '.join(matched)}\n")
@@ -405,7 +442,7 @@ class MerchantNotifyPlugin(Star):
             price = item["price_text"] or "未知价格"
             limit = item["limit_text"] or "限购未知"
             lines.append(f"{item['slot']}. {item['name']} | {price} | {limit}")
-            
+
         message = "\n".join(lines)
         time_str = display_time.strftime("%Y-%m-%d %H:%M")
         full_text = f"【{title}】\n{message}\n\n🕒 检查时间：{time_str}"
@@ -413,15 +450,15 @@ class MerchantNotifyPlugin(Star):
         # 状态发生变化时保存数据
         if changed:
             self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            
+
             history_lines = []
             if self.history_path.exists():
                 try:
                     with self.history_path.open("r", encoding="utf-8") as fp:
                         history_lines = fp.readlines()
                 except Exception as e:
-                    logging.error(f"[{self.name}] 读取历史记录失败: {e}")
-            
+                    self.logger.error(f"读取历史记录失败: {e}")
+
             history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
             history_lines = history_lines[-1000:]
 
@@ -429,11 +466,11 @@ class MerchantNotifyPlugin(Star):
                 with self.history_path.open("w", encoding="utf-8") as fp:
                     fp.writelines(history_lines)
             except Exception as e:
-                logging.error(f"[{self.name}] 写入历史记录失败: {e}")
+                self.logger.error(f"写入历史记录失败: {e}")
 
             # 分发推送
             if send_alert and self.subscribers:
-                logging.info(f"[{self.name}] 检测到数据更新，开始处理分群过滤推送...")
+                self.logger.info(f"检测到数据更新，开始处理分群过滤推送...")
                 for umo, settings in self.subscribers.items():
                     push_mode = settings.get("push_mode", 1)
                     mention_everyone = settings.get("mention_everyone", 0)
@@ -453,8 +490,9 @@ class MerchantNotifyPlugin(Star):
                             chain.message(full_text)
                             # 使用 asyncio.create_task 避免单一群聊发送卡死阻塞总流程
                             asyncio.create_task(self.context.send_message(umo, chain))
+                            self.logger.info(f"已向 {umo} 发送推送")
                         except Exception as e:
-                            logging.error(f"[{self.name}] 向 {umo} 推送失败: {e}")
+                            self.logger.error(f"向 {umo} 推送失败: {e}")
 
         return full_text, changed
 
@@ -571,6 +609,7 @@ class MerchantNotifyPlugin(Star):
             result_msg, _ = await self.execute_check(send_alert=False)
             yield event.plain_result(result_msg + self.HINT_LINE)
         except Exception as e:
+            self.logger.error(f"手动查询异常: {e}", exc_info=True)
             yield event.plain_result(f"查询失败: {str(e)}" + self.HINT_LINE)
 
     @command("商人历史")
@@ -584,7 +623,7 @@ class MerchantNotifyPlugin(Star):
             with self.history_path.open("r", encoding="utf-8") as fp:
                 history_lines = fp.readlines()
         except Exception as e:
-            logging.error(f"[{self.name}] 读取历史记录失败: {e}")
+            self.logger.error(f"读取历史记录失败: {e}")
             yield event.plain_result(f"查询失败: {str(e)}" + self.HINT_LINE)
             return
 
@@ -612,7 +651,7 @@ class MerchantNotifyPlugin(Star):
 
                 lines.append(f"[{time_str}] [{', '.join(item_names) if item_names else '空'}]")
             except Exception as e:
-                logging.error(f"[{self.name}] 解析历史记录失败: {e}")
+                self.logger.error(f"解析历史记录失败: {e}")
                 continue
 
         if not lines:
