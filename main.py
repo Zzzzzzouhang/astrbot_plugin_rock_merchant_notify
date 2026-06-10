@@ -382,15 +382,27 @@ class MerchantNotifyPlugin(Star):
                             should_push = True
 
                     if should_push:
-                        try:
-                            chain = MessageChain()
-                            if mention_everyone == 1:
-                                chain.at_all()
-                            chain.message(full_text)
-                            await self.context.send_message(umo, chain)
-                            self.logger.info(f"已向 {umo} 发送推送")
-                        except Exception as e:
-                            self.logger.error(f"向 {umo} 推送失败: {e}")
+                        chain = MessageChain()
+                        if mention_everyone == 1:
+                            chain.at_all()
+                        chain.message(full_text)
+
+                        # 推送重试逻辑：最多 3 次，失败间隔 5 秒
+                        max_retries = 3
+                        retry_delay = 5
+                        for attempt in range(1, max_retries + 1):
+                            try:
+                                await self.context.send_message(umo, chain)
+                                self.logger.info(f"已向 {umo} 发送推送")
+                                break
+                            except Exception as e:
+                                self.logger.error(f"向 {umo} 推送失败 (第 {attempt}/{max_retries} 次): {e}", exc_info=True)
+                                if attempt < max_retries:
+                                    self.logger.info(f"{retry_delay} 秒后重试...")
+                                    await asyncio.sleep(retry_delay)
+                                else:
+                                    self.logger.error(f"向 {umo} 推送已达最大重试次数，放弃推送。")
+
                         # 每条消息推送后等待配置的间隔时间
                         await asyncio.sleep(push_interval)
 
@@ -486,15 +498,27 @@ class MerchantNotifyPlugin(Star):
                             should_push = True
 
                     if should_push:
-                        try:
-                            chain = MessageChain()
-                            if mention_everyone == 1:
-                                chain.at_all()
-                            chain.message(full_text)
-                            await self.context.send_message(umo, chain)
-                            self.logger.info(f"已向 {umo} 发送推送")
-                        except Exception as e:
-                            self.logger.error(f"向 {umo} 推送失败: {e}")
+                        chain = MessageChain()
+                        if mention_everyone == 1:
+                            chain.at_all()
+                        chain.message(full_text)
+
+                        # 推送重试逻辑：最多 3 次，失败间隔 5 秒
+                        max_retries = 3
+                        retry_delay = 5
+                        for attempt in range(1, max_retries + 1):
+                            try:
+                                await self.context.send_message(umo, chain)
+                                self.logger.info(f"已向 {umo} 发送推送")
+                                break
+                            except Exception as e:
+                                self.logger.error(f"向 {umo} 推送失败 (第 {attempt}/{max_retries} 次): {e}", exc_info=True)
+                                if attempt < max_retries:
+                                    self.logger.info(f"{retry_delay} 秒后重试...")
+                                    await asyncio.sleep(retry_delay)
+                                else:
+                                    self.logger.error(f"向 {umo} 推送已达最大重试次数，放弃推送。")
+
                         # 每条消息推送后等待配置的间隔时间
                         await asyncio.sleep(push_interval)
 
