@@ -16,7 +16,7 @@
   },
   "push_interval_seconds": {
     "description": "向每个订阅位置推送消息的间隔秒数，防止消息发送过快被平台限制 (默认 5 秒，推荐 5 秒)",
-    "type": "integer",
+    "type": "int",
     "default": 5
   }
 }
