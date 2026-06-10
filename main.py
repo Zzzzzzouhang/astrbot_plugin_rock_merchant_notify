@@ -53,9 +53,11 @@ def parse_current_slot(soup: BeautifulSoup) -> dict[str, Any]:
     if not time_items:
         raise ValueError("Failed to find time slots in merchant page")
 
-    for index, element in enumerate(time_items, start=1):
-        if "on" not in element.get("class", []):
-            continue
+    active_items = [el for el in time_items if "on" in el.get("class", [])]
+
+    if len(active_items) == 1:
+        element = active_items[0]
+        index = time_items.index(element) + 1
         values = [em.get_text(strip=True) for em in element.select("em")]
         start = values[0] if len(values) > 0 else ""
         end = values[1] if len(values) > 1 else ""
@@ -66,14 +68,17 @@ def parse_current_slot(soup: BeautifulSoup) -> dict[str, Any]:
             "end": end,
         }
 
-    first = time_items[0]
-    values = [em.get_text(strip=True) for em in first.select("em")]
-    return {
-        "index": int(first.get("data-index", 1)),
-        "label": f"{values[0]}-{values[1]}" if len(values) >= 2 else "slot-1",
-        "start": values[0] if len(values) >= 1 else "",
-        "end": values[1] if len(values) >= 2 else "",
-    }
+    if len(active_items) == 0:
+        element = time_items[0]
+        values = [em.get_text(strip=True) for em in element.select("em")]
+        return {
+            "index": int(element.get("data-index", 1)),
+            "label": f"{values[0]}-{values[1]}" if len(values) >= 2 else "slot-1",
+            "start": values[0] if len(values) >= 1 else "",
+            "end": values[1] if len(values) >= 2 else "",
+        }
+
+    raise ValueError(f"Multiple active slots detected ({len(active_items)} found), page state ambiguous")
 
 def parse_items(html: str) -> dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
@@ -137,7 +142,7 @@ class MerchantNotifyPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
-        
+
         self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / self.name
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.data_dir / "latest.json"
@@ -149,13 +154,16 @@ class MerchantNotifyPlugin(Star):
         self.logger = _setup_file_logger(self.name, self.log_path)
 
         self.subscribers = self._load_subscribers()
-        
-        # 新增：用于控制单次时间窗口内抓取频次的状态变量
+
+        # 用于控制单次时间窗口内抓取频次的状态变量
         self.current_active_slot = None
         self.attempt_count = 0
         self.slot_success = False
         self.last_fetch_result = None  # 保存上一次抓取结果用于比较
-        
+
+        # 异步锁保护共享状态
+        self._state_lock = asyncio.Lock()
+
         # 启动后台定时轮询任务
         self._polling_task = asyncio.create_task(self.poll_loop())
 
@@ -212,57 +220,60 @@ class MerchantNotifyPlugin(Star):
                 current_time = datetime.now(ZoneInfo(self.timezone))
                 active_slot = self.get_active_slot(current_time)
 
-                if not active_slot:
-                    # 不在任何窗口期，清理状态并保持沉睡
-                    if self.current_active_slot is not None:
-                        self.logger.info(f"窗口期结束，清理轮询状态")
-                    self.current_active_slot = None
-                    self.attempt_count = 0
-                    self.slot_success = False
-                    self.last_fetch_result = None
-                else:
-                    # 进入了一个新的时间窗口
-                    if active_slot != self.current_active_slot:
-                        self.current_active_slot = active_slot
+                async with self._state_lock:
+                    if not active_slot:
+                        # 不在任何窗口期，清理状态并保持沉睡
+                        if self.current_active_slot is not None:
+                            self.logger.info("窗口期结束，清理轮询状态")
+                        self.current_active_slot = None
                         self.attempt_count = 0
                         self.slot_success = False
                         self.last_fetch_result = None
-                        self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
+                    else:
+                        # 进入了一个新的时间窗口
+                        if active_slot != self.current_active_slot:
+                            self.current_active_slot = active_slot
+                            self.attempt_count = 0
+                            self.slot_success = False
+                            self.last_fetch_result = None
+                            self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
 
-                    # 只有在未获取到新数据，且尝试次数没超限时，才执行抓取
-                    if not self.slot_success and self.attempt_count < 5:
-                        self.attempt_count += 1
-                        self.logger.info(f"正在执行 {active_slot} 窗口期的第 {self.attempt_count}/5 次抓取检测...")
+                        # 只有在未获取到新数据，且尝试次数没超限时，才执行抓取
+                        if not self.slot_success and self.attempt_count < 5:
+                            self.attempt_count += 1
+                            self.logger.info(f"正在执行 {active_slot} 窗口期的第 {self.attempt_count}/5 次抓取检测...")
 
-                        # 执行抓取但不立即推送，仅获取数据
-                        current_payload, _ = await self.execute_fetch_only()
+                            # 执行抓取但不立即推送，仅获取数据
+                            current_payload, _ = await self.execute_fetch_only()
 
-                        # 第一次抓取：保存结果，继续下一次
-                        if self.attempt_count == 1:
-                            self.last_fetch_result = current_payload
-                            self.logger.info(f"{active_slot} 第1次抓取完成，等待下次抓取比对...")
-                        else:
-                            # 第二次及以后：与上一次结果比较
-                            if comparable_payload(self.last_fetch_result) == comparable_payload(current_payload):
-                                # 两次结果一致，说明网页已稳定，强制推送
-                                # 轮询确认的新窗口数据，应当视为有效变更
-                                self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
-                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                self.slot_success = True
-                                self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
-                            else:
-                                # 结果不一致，更新缓存继续抓取
+                            # 第一次抓取：保存结果，继续下一次
+                            if self.attempt_count == 1:
                                 self.last_fetch_result = current_payload
-                                self.logger.info(f"{active_slot} 第 {self.attempt_count} 次抓取结果与上次不一致，继续比对...")
+                                self.logger.info(f"{active_slot} 第1次抓取完成，等待下次抓取比对...")
+                            else:
+                                # 第二次及以后：与上一次结果比较
+                                if comparable_payload(self.last_fetch_result) == comparable_payload(current_payload):
+                                    # 两次结果一致，说明网页已稳定，强制推送
+                                    self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
+                                    await self.process_and_push(current_payload, send_alert=True, force_save=True)
+                                    self.slot_success = True
+                                    self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
+                                else:
+                                    # 结果不一致，更新缓存继续抓取
+                                    self.last_fetch_result = current_payload
+                                    self.logger.info(f"{active_slot} 第 {self.attempt_count} 次抓取结果与上次不一致，继续比对...")
 
-                            # 达到最大次数兜底
-                            if self.attempt_count >= 5 and not self.slot_success:
-                                # 使用最后一次结果推送
-                                self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送")
-                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                self.slot_success = True
-                                self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
+                                # 达到最大次数兜底
+                                if self.attempt_count >= 5 and not self.slot_success:
+                                    # 使用最后一次结果推送
+                                    self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送")
+                                    await self.process_and_push(current_payload, send_alert=True, force_save=True)
+                                    self.slot_success = True
+                                    self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
 
+            except asyncio.CancelledError:
+                self.logger.info("轮询任务被取消，正常退出")
+                break
             except Exception as e:
                 self.logger.error(f"Polling error: {e}", exc_info=True)
 
@@ -292,7 +303,7 @@ class MerchantNotifyPlugin(Star):
             try:
                 previous = json.loads(self.state_path.read_text(encoding="utf-8"))
             except Exception as e:
-                logging.error(f"[{self.name}] 读取历史状态失败: {e}")
+                self.logger.error(f"[{self.name}] 读取历史状态失败: {e}")
 
         changed = has_changed(previous, payload)
         
@@ -327,84 +338,16 @@ class MerchantNotifyPlugin(Star):
         else:
             display_time = current_time
 
-        watch_items = self.get_watch_items()
-        matched = [item["name"] for item in payload["items"] if item["name"] in watch_items]
-
-        slot_label = payload["slot"]["label"]
-        title = f"远行商人已刷新 {slot_label}" if not matched else f"远行商人命中关注商品 {slot_label}"
-
-        lines = []
-        if matched:
-            lines.append(f"🎯 关注商品：{', '.join(matched)}\n")
-        for item in payload["items"]:
-            price = item["price_text"] or "未知价格"
-            limit = item["limit_text"] or "限购未知"
-            lines.append(f"{item['slot']}. {item['name']} | {price} | {limit}")
-
-        message = "\n".join(lines)
-        time_str = display_time.strftime("%Y-%m-%d %H:%M")
-        full_text = f"【{title}】\n{message}\n\n🕒 检查时间：{time_str}"
+        full_text, matched = self._build_message(payload, display_time)
 
         # 状态发生变化，或强制保存时，保存数据
         if changed or force_save:
-            self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            history_lines = []
-            if self.history_path.exists():
-                try:
-                    with self.history_path.open("r", encoding="utf-8") as fp:
-                        history_lines = fp.readlines()
-                except Exception as e:
-                    self.logger.error(f"读取历史记录失败: {e}")
-
-            history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
-            history_lines = history_lines[-1000:]
-
-            try:
-                with self.history_path.open("w", encoding="utf-8") as fp:
-                    fp.writelines(history_lines)
-            except Exception as e:
-                self.logger.error(f"写入历史记录失败: {e}")
+            self._save_history(payload)
 
             # 分发推送
-            if send_alert and self.subscribers:
+            if send_alert:
                 push_interval = self.config.get("push_interval_seconds", 5)
-                self.logger.info(f"检测到数据更新，开始处理分群过滤推送，间隔 {push_interval} 秒...")
-                for umo, settings in self.subscribers.items():
-                    push_mode = settings.get("push_mode", 1)
-                    mention_everyone = settings.get("mention_everyone", 0)
-
-                    should_push = False
-                    if push_mode == 0:
-                        should_push = True
-                    elif push_mode == 1:
-                        if matched:
-                            should_push = True
-
-                    if should_push:
-                        chain = MessageChain()
-                        if mention_everyone == 1:
-                            chain.at_all()
-                        chain.message(full_text)
-
-                        # 推送重试逻辑：最多 3 次，失败间隔 5 秒
-                        max_retries = 3
-                        retry_delay = 5
-                        for attempt in range(1, max_retries + 1):
-                            try:
-                                await self.context.send_message(umo, chain)
-                                self.logger.info(f"已向 {umo} 发送推送")
-                                break
-                            except Exception as e:
-                                self.logger.error(f"向 {umo} 推送失败 (第 {attempt}/{max_retries} 次): {e}", exc_info=True)
-                                if attempt < max_retries:
-                                    self.logger.info(f"{retry_delay} 秒后重试...")
-                                    await asyncio.sleep(retry_delay)
-                                else:
-                                    self.logger.error(f"向 {umo} 推送已达最大重试次数，放弃推送。")
-
-                        # 每条消息推送后等待配置的间隔时间
-                        await asyncio.sleep(push_interval)
+                await self._dispatch_push(full_text, matched, push_interval)
 
         return full_text
 
@@ -443,84 +386,16 @@ class MerchantNotifyPlugin(Star):
         else:
             display_time = current_time
 
-        watch_items = self.get_watch_items()
-        matched = [item["name"] for item in payload["items"] if item["name"] in watch_items]
-
-        slot_label = payload["slot"]["label"]
-        title = f"远行商人已刷新 {slot_label}" if not matched else f"远行商人命中关注商品 {slot_label}"
-
-        lines = []
-        if matched:
-            lines.append(f"🎯 关注商品：{', '.join(matched)}\n")
-        for item in payload["items"]:
-            price = item["price_text"] or "未知价格"
-            limit = item["limit_text"] or "限购未知"
-            lines.append(f"{item['slot']}. {item['name']} | {price} | {limit}")
-
-        message = "\n".join(lines)
-        time_str = display_time.strftime("%Y-%m-%d %H:%M")
-        full_text = f"【{title}】\n{message}\n\n🕒 检查时间：{time_str}"
+        full_text, matched = self._build_message(payload, display_time)
 
         # 状态发生变化时保存数据
         if changed:
-            self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            history_lines = []
-            if self.history_path.exists():
-                try:
-                    with self.history_path.open("r", encoding="utf-8") as fp:
-                        history_lines = fp.readlines()
-                except Exception as e:
-                    self.logger.error(f"读取历史记录失败: {e}")
-
-            history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
-            history_lines = history_lines[-1000:]
-
-            try:
-                with self.history_path.open("w", encoding="utf-8") as fp:
-                    fp.writelines(history_lines)
-            except Exception as e:
-                self.logger.error(f"写入历史记录失败: {e}")
+            self._save_history(payload)
 
             # 分发推送
-            if send_alert and self.subscribers:
+            if send_alert:
                 push_interval = self.config.get("push_interval_seconds", 5)
-                self.logger.info(f"检测到数据更新，开始处理分群过滤推送，间隔 {push_interval} 秒...")
-                for umo, settings in self.subscribers.items():
-                    push_mode = settings.get("push_mode", 1)
-                    mention_everyone = settings.get("mention_everyone", 0)
-
-                    should_push = False
-                    if push_mode == 0:
-                        should_push = True
-                    elif push_mode == 1:
-                        if matched:
-                            should_push = True
-
-                    if should_push:
-                        chain = MessageChain()
-                        if mention_everyone == 1:
-                            chain.at_all()
-                        chain.message(full_text)
-
-                        # 推送重试逻辑：最多 3 次，失败间隔 5 秒
-                        max_retries = 3
-                        retry_delay = 5
-                        for attempt in range(1, max_retries + 1):
-                            try:
-                                await self.context.send_message(umo, chain)
-                                self.logger.info(f"已向 {umo} 发送推送")
-                                break
-                            except Exception as e:
-                                self.logger.error(f"向 {umo} 推送失败 (第 {attempt}/{max_retries} 次): {e}", exc_info=True)
-                                if attempt < max_retries:
-                                    self.logger.info(f"{retry_delay} 秒后重试...")
-                                    await asyncio.sleep(retry_delay)
-                                else:
-                                    self.logger.error(f"向 {umo} 推送已达最大重试次数，放弃推送。")
-
-                        # 每条消息推送后等待配置的间隔时间
-                        await asyncio.sleep(push_interval)
+                await self._dispatch_push(full_text, matched, push_interval)
 
         return full_text, changed
 
@@ -628,6 +503,101 @@ class MerchantNotifyPlugin(Star):
 
         status_names = {0: "不@全员", 1: "@全员"}
         yield event.plain_result(f"✅ 设置成功！当前群聊的艾特状态已修改为：【{status_names[status_int]}】" + self.HINT_LINE)
+
+    def cleanup(self):
+        """插件卸载时清理后台任务"""
+        if hasattr(self, "_polling_task") and not self._polling_task.done():
+            self._polling_task.cancel()
+            self.logger.info("已取消后台轮询任务")
+
+    def _build_message(self, payload: dict[str, Any], display_time: datetime) -> tuple[str, list[str]]:
+        """构建推送消息文本，返回 (完整消息, 匹配商品列表)"""
+        watch_items = self.get_watch_items()
+        matched = [item["name"] for item in payload["items"] if item["name"] in watch_items]
+
+        slot_label = payload["slot"]["label"]
+        title = f"远行商人已刷新 {slot_label}" if not matched else f"远行商人命中关注商品 {slot_label}"
+
+        lines = []
+        if matched:
+            lines.append(f"🎯 关注商品：{', '.join(matched)}")
+        for item in payload["items"]:
+            price = item["price_text"] or "未知价格"
+            limit = item["limit_text"] or "限购未知"
+            lines.append(f"{item['slot']}. {item['name']} | {price} | {limit}")
+
+        message = "\n".join(lines)
+        time_str = display_time.strftime("%Y-%m-%d %H:%M")
+        full_text = f"【{title}】\n{message}\n\n🕒 检查时间：{time_str}"
+
+        return full_text, matched
+
+    def _save_history(self, payload: dict[str, Any]):
+        """保存状态到 latest.json 并追加到 history.jsonl"""
+        self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        history_lines = []
+        if self.history_path.exists():
+            try:
+                with self.history_path.open("r", encoding="utf-8") as fp:
+                    history_lines = fp.readlines()
+            except Exception as e:
+                self.logger.error(f"读取历史记录失败: {e}")
+
+        history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
+        history_lines = history_lines[-1000:]
+
+        try:
+            with self.history_path.open("w", encoding="utf-8") as fp:
+                fp.writelines(history_lines)
+        except Exception as e:
+            self.logger.error(f"写入历史记录失败: {e}")
+
+    async def _dispatch_push(self, full_text: str, matched: list[str], push_interval: int):
+        """向所有订阅者分发消息"""
+        if not self.subscribers:
+            return
+
+        self.logger.info(f"开始处理分群过滤推送，间隔 {push_interval} 秒...")
+        for umo, settings in self.subscribers.items():
+            push_mode = settings.get("push_mode", 1)
+            mention_everyone = settings.get("mention_everyone", 0)
+
+            should_push = False
+            if push_mode == 0:
+                should_push = True
+            elif push_mode == 1:
+                if matched:
+                    should_push = True
+            # push_mode == 2 完全不推送
+
+            if should_push:
+                chain = MessageChain()
+                if mention_everyone == 1:
+                    chain.at_all()
+                chain.message(full_text)
+
+                success = await self._push_with_retry(umo, chain)
+                if success:
+                    await asyncio.sleep(push_interval)
+
+    async def _push_with_retry(self, umo: str, chain: MessageChain) -> bool:
+        """推送单条消息，带重试机制。返回是否成功。"""
+        max_retries = 3
+        retry_delay = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self.context.send_message(umo, chain)
+                self.logger.info(f"已向 {umo} 发送推送")
+                return True
+            except Exception as e:
+                self.logger.error(f"向 {umo} 推送失败 (第 {attempt}/{max_retries} 次): {e}", exc_info=True)
+                if attempt < max_retries:
+                    self.logger.info(f"{retry_delay} 秒后重试...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    self.logger.error(f"向 {umo} 推送已达最大重试次数，放弃推送。")
+        return False
 
     @command("远行商人")
     async def manual_check(self, event: AstrMessageEvent):

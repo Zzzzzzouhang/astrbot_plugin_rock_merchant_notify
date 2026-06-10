@@ -9,6 +9,11 @@
     "type": "string",
     "default": "08:01,12:01,16:01,20:01"
   },
+  "refresh_window_minutes": {
+    "description": "刷新窗口期(分钟)，仅在该窗口时间内才会触发实际抓取",
+    "type": "int",
+    "default": 60
+  },
   "watch_items": {
     "description": "重点关注的商品名称 (逗号分隔)",
     "type": "string",
