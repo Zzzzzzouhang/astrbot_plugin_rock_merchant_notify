@@ -27,7 +27,7 @@
 
 1. 在"输入插件仓库链接"输入框中粘贴本插件的 GitHub 地址：
 ```text
-   https://github.com/Zzzzzzouhang/astrbot_plugin_tuqunmanage
+   https://github.com/Zzzzzzouhang/astrbot_plugin_rock_merchant_notify
    ```
 2. 根据你的网络状况选择是否开启 **GitHub 加速**。
 3. 点击 **安装**，等待面板提示下载完成。
@@ -36,7 +36,7 @@
 如果你无法通过面板联网安装，也可以手动将本仓库克隆到你 AstrBot 运行目录的 `data/plugins/` 下：
 ```bash
 cd data/plugins/
-git clone https://github.com/Zzzzzzouhang/astrbot_plugin_tuqunmanage.git
+git clone https://github.com/Zzzzzzouhang/astrbot_plugin_rock_merchant_notify.git
 ```
 
 ### 3. 安装依赖
