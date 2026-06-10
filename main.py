@@ -631,8 +631,9 @@ class MerchantNotifyPlugin(Star):
             yield event.plain_result("⚠️ 暂无历史记录。" + self.HINT_LINE)
             return
 
-        # 取最近 15 条
+        # 取最近 15 条，并按时间倒序排列（最新的在最前面）
         recent_lines = history_lines[-15:]
+        recent_lines.reverse()
 
         lines = []
         for line in recent_lines:
