@@ -13,5 +13,10 @@
     "description": "重点关注的商品名称 (逗号分隔)",
     "type": "string",
     "default": "国王球,棱镜球,炫彩精灵蛋,炫彩蛋,祝福吊坠"
+  },
+  "push_interval_seconds": {
+    "description": "向每个订阅位置推送消息的间隔秒数，防止消息发送过快被平台限制 (默认 5 秒，推荐 5 秒)",
+    "type": "integer",
+    "default": 5
   }
 }

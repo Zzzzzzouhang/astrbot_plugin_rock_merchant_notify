@@ -368,7 +368,8 @@ class MerchantNotifyPlugin(Star):
 
             # 分发推送
             if send_alert and self.subscribers:
-                self.logger.info(f"检测到数据更新，开始处理分群过滤推送...")
+                push_interval = self.config.get("push_interval_seconds", 5)
+                self.logger.info(f"检测到数据更新，开始处理分群过滤推送，间隔 {push_interval} 秒...")
                 for umo, settings in self.subscribers.items():
                     push_mode = settings.get("push_mode", 1)
                     mention_everyone = settings.get("mention_everyone", 0)
@@ -386,11 +387,12 @@ class MerchantNotifyPlugin(Star):
                             if mention_everyone == 1:
                                 chain.at_all()
                             chain.message(full_text)
-                            # 使用 asyncio.create_task 避免单一群聊发送卡死阻塞总流程
-                            asyncio.create_task(self.context.send_message(umo, chain))
+                            await self.context.send_message(umo, chain)
                             self.logger.info(f"已向 {umo} 发送推送")
                         except Exception as e:
                             self.logger.error(f"向 {umo} 推送失败: {e}")
+                        # 每条消息推送后等待配置的间隔时间
+                        await asyncio.sleep(push_interval)
 
         return full_text
 
@@ -470,7 +472,8 @@ class MerchantNotifyPlugin(Star):
 
             # 分发推送
             if send_alert and self.subscribers:
-                self.logger.info(f"检测到数据更新，开始处理分群过滤推送...")
+                push_interval = self.config.get("push_interval_seconds", 5)
+                self.logger.info(f"检测到数据更新，开始处理分群过滤推送，间隔 {push_interval} 秒...")
                 for umo, settings in self.subscribers.items():
                     push_mode = settings.get("push_mode", 1)
                     mention_everyone = settings.get("mention_everyone", 0)
@@ -488,11 +491,12 @@ class MerchantNotifyPlugin(Star):
                             if mention_everyone == 1:
                                 chain.at_all()
                             chain.message(full_text)
-                            # 使用 asyncio.create_task 避免单一群聊发送卡死阻塞总流程
-                            asyncio.create_task(self.context.send_message(umo, chain))
+                            await self.context.send_message(umo, chain)
                             self.logger.info(f"已向 {umo} 发送推送")
                         except Exception as e:
                             self.logger.error(f"向 {umo} 推送失败: {e}")
+                        # 每条消息推送后等待配置的间隔时间
+                        await asyncio.sleep(push_interval)
 
         return full_text, changed
 
