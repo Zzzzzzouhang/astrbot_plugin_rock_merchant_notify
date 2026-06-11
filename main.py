@@ -135,6 +135,14 @@ def has_changed(previous: dict[str, Any] | None, current: dict[str, Any]) -> boo
     return comparable_payload(previous) != comparable_payload(current)
 
 
+# ==================== 模块级共享轮询状态（防多实例重复抓取） ====================
+_shared_poll_lock = asyncio.Lock()
+_shared_active_slot: str | None = None
+_shared_attempt_count: int = 0
+_shared_slot_success: bool = False
+_shared_last_fetch_result: dict[str, Any] | None = None
+_shared_last_pushed_payload: dict[str, Any] | None = None
+
 # ==================== AstrBot 插件实体 ====================
 
 @register("astrbot_plugin_rock_merchant_notify", "AstrBot", "远行商人监控插件", "1.3.0", "支持不同群聊独立配置推送模式及艾特规则")
@@ -158,15 +166,7 @@ class MerchantNotifyPlugin(Star):
 
         self.subscribers = self._load_subscribers()
 
-        # 用于控制单次时间窗口内抓取频次的状态变量
-        self.current_active_slot = None
-        self.attempt_count = 0
-        self.slot_success = False
-        self.last_fetch_result = None  # 保存上一次抓取结果用于比较
-        self.last_pushed_payload = None  # 保存上一次已推送的payload，防止重复推送
-
-        # 异步锁保护共享状态
-        self._state_lock = asyncio.Lock()
+        # 轮询状态已迁移至模块级共享变量 _shared_* ，避免多实例重复抓取
         # 文件写入锁，防止并发写 history / subscribers
         self._file_lock = asyncio.Lock()
 
@@ -221,72 +221,75 @@ class MerchantNotifyPlugin(Star):
         return None
 
     async def poll_loop(self):
-        """后台轮询任务，支持完成打断与次数限制熔断"""
+        """后台轮询任务，使用模块级共享状态确保多实例下仅一份抓取逻辑运行"""
+        global _shared_active_slot, _shared_attempt_count, _shared_slot_success
+        global _shared_last_fetch_result, _shared_last_pushed_payload
+
         while True:
             try:
                 current_time = datetime.now(ZoneInfo(self.timezone))
                 active_slot = self.get_active_slot(current_time)
 
-                async with self._state_lock:
+                async with _shared_poll_lock:
                     if not active_slot:
                         # 不在任何窗口期，清理状态并保持沉睡
-                        if self.current_active_slot is not None:
+                        if _shared_active_slot is not None:
                             self.logger.info("窗口期结束，清理轮询状态")
-                        self.current_active_slot = None
-                        self.attempt_count = 0
-                        self.slot_success = False
-                        self.last_fetch_result = None
-                        self.last_pushed_payload = None
+                        _shared_active_slot = None
+                        _shared_attempt_count = 0
+                        _shared_slot_success = False
+                        _shared_last_fetch_result = None
+                        _shared_last_pushed_payload = None
                     else:
                         # 进入了一个新的时间窗口
-                        if active_slot != self.current_active_slot:
-                            self.current_active_slot = active_slot
-                            self.attempt_count = 0
-                            self.slot_success = False
-                            self.last_fetch_result = None
-                            self.last_pushed_payload = None
+                        if active_slot != _shared_active_slot:
+                            _shared_active_slot = active_slot
+                            _shared_attempt_count = 0
+                            _shared_slot_success = False
+                            _shared_last_fetch_result = None
+                            _shared_last_pushed_payload = None
                             self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
 
                         # 只有在未获取到新数据，且尝试次数没超限时，才执行抓取
-                        if not self.slot_success and self.attempt_count < 5:
-                            self.attempt_count += 1
-                            self.logger.info(f"正在执行 {active_slot} 窗口期的第 {self.attempt_count}/5 次抓取检测...")
+                        if not _shared_slot_success and _shared_attempt_count < 5:
+                            _shared_attempt_count += 1
+                            self.logger.info(f"正在执行 {active_slot} 窗口期的第 {_shared_attempt_count}/5 次抓取检测...")
 
                             # 执行抓取但不立即推送，仅获取数据
                             current_payload, _ = await self.execute_fetch_only()
 
                             # 第一次抓取：保存结果，继续下一次
-                            if self.attempt_count == 1:
-                                self.last_fetch_result = current_payload
+                            if _shared_attempt_count == 1:
+                                _shared_last_fetch_result = current_payload
                                 self.logger.info(f"{active_slot} 第1次抓取完成，等待下次抓取比对...")
                             else:
                                 # 第二次及以后：与上一次结果比较
-                                if comparable_payload(self.last_fetch_result) == comparable_payload(current_payload):
+                                if comparable_payload(_shared_last_fetch_result) == comparable_payload(current_payload):
                                     # 两次结果一致，说明网页已稳定，检查是否已推送过
-                                    if self.last_pushed_payload is None or comparable_payload(self.last_pushed_payload) != comparable_payload(current_payload):
+                                    if _shared_last_pushed_payload is None or comparable_payload(_shared_last_pushed_payload) != comparable_payload(current_payload):
                                         self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
                                         await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                        self.last_pushed_payload = current_payload
-                                        self.slot_success = True
+                                        _shared_last_pushed_payload = current_payload
+                                        _shared_slot_success = True
                                         self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
                                     else:
                                         self.logger.info(f"{active_slot} 结果已推送过，跳过重复推送")
-                                        self.slot_success = True
+                                        _shared_slot_success = True
                                 else:
                                     # 结果不一致，更新缓存继续抓取
-                                    self.last_fetch_result = current_payload
-                                    self.logger.info(f"{active_slot} 第 {self.attempt_count} 次抓取结果与上次不一致，继续比对...")
+                                    _shared_last_fetch_result = current_payload
+                                    self.logger.info(f"{active_slot} 第 {_shared_attempt_count} 次抓取结果与上次不一致，继续比对...")
 
                                 # 达到最大次数兜底
-                                if self.attempt_count >= 5 and not self.slot_success:
+                                if _shared_attempt_count >= 5 and not _shared_slot_success:
                                     # 检查是否已推送过
-                                    if self.last_pushed_payload is None or comparable_payload(self.last_pushed_payload) != comparable_payload(current_payload):
+                                    if _shared_last_pushed_payload is None or comparable_payload(_shared_last_pushed_payload) != comparable_payload(current_payload):
                                         self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送")
                                         await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                        self.last_pushed_payload = current_payload
+                                        _shared_last_pushed_payload = current_payload
                                     else:
                                         self.logger.info(f"{active_slot} 结果已推送过，跳过重复推送")
-                                    self.slot_success = True
+                                    _shared_slot_success = True
                                     self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
 
             except asyncio.CancelledError:
