@@ -167,6 +167,8 @@ class MerchantNotifyPlugin(Star):
 
         # 异步锁保护共享状态
         self._state_lock = asyncio.Lock()
+        # 文件写入锁，防止并发写 history / subscribers
+        self._file_lock = asyncio.Lock()
 
         # 启动后台定时轮询任务
         self._polling_task = asyncio.create_task(self.poll_loop())
@@ -182,8 +184,9 @@ class MerchantNotifyPlugin(Star):
                 self.logger.error(f"读取订阅列表失败: {e}")
         return {}
 
-    def _save_subscribers(self):
-        self.subscribers_path.write_text(json.dumps(self.subscribers, ensure_ascii=False), encoding="utf-8")
+    async def _save_subscribers(self):
+        async with self._file_lock:
+            self.subscribers_path.write_text(json.dumps(self.subscribers, ensure_ascii=False), encoding="utf-8")
 
     def _check_admin(self, event: AstrMessageEvent) -> bool:
         """管理指令权限校验：群聊仅管理员/群主可用，私聊直接放行"""
@@ -357,7 +360,7 @@ class MerchantNotifyPlugin(Star):
 
         # 状态发生变化，或强制保存时，保存数据
         if changed or force_save:
-            self._save_history(payload)
+            await self._save_history(payload)
 
             # 分发推送
             if send_alert:
@@ -405,7 +408,7 @@ class MerchantNotifyPlugin(Star):
 
         # 状态发生变化时保存数据
         if changed:
-            self._save_history(payload)
+            await self._save_history(payload)
 
             # 分发推送
             if send_alert:
@@ -426,7 +429,7 @@ class MerchantNotifyPlugin(Star):
                 "push_mode": 1,
                 "mention_everyone": 0
             }
-            self._save_subscribers()
+            await self._save_subscribers()
             yield event.plain_result(
                 "✅ 订阅成功！远行商人刷新时本窗口将自动收到推送。\n\n"
                 "💡 当前群聊初始默认规则：\n"
@@ -470,7 +473,7 @@ class MerchantNotifyPlugin(Star):
         umo = event.unified_msg_origin
         if umo in self.subscribers:
             del self.subscribers[umo]
-            self._save_subscribers()
+            await self._save_subscribers()
             yield event.plain_result("✅ 已取消订阅，本窗口不再接收商人刷新推送。" + self.HINT_LINE)
         else:
             yield event.plain_result("⚠️ 当前位置尚未订阅。" + self.HINT_LINE)
@@ -492,7 +495,7 @@ class MerchantNotifyPlugin(Star):
 
         mode_int = int(mode)
         self.subscribers[umo]["push_mode"] = mode_int
-        self._save_subscribers()
+        await self._save_subscribers()
 
         mode_names = {0: "全部推送", 1: "只匹配到商品推送", 2: "完全不推送"}
         yield event.plain_result(f"✅ 设置成功！当前群聊的推送模式已修改为：【{mode_names[mode_int]}】" + self.HINT_LINE)
@@ -514,7 +517,7 @@ class MerchantNotifyPlugin(Star):
 
         status_int = int(status)
         self.subscribers[umo]["mention_everyone"] = status_int
-        self._save_subscribers()
+        await self._save_subscribers()
 
         status_names = {0: "不@全员", 1: "@全员"}
         yield event.plain_result(f"✅ 设置成功！当前群聊的艾特状态已修改为：【{status_names[status_int]}】" + self.HINT_LINE)
@@ -546,41 +549,41 @@ class MerchantNotifyPlugin(Star):
 
         return full_text, matched
 
-    def _save_history(self, payload: dict[str, Any]):
+    async def _save_history(self, payload: dict[str, Any]):
         """保存状态到 latest.json 并追加到 history.jsonl（带去重）"""
-        self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        async with self._file_lock:
+            self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        history_lines = []
-        if self.history_path.exists():
-            try:
-                with self.history_path.open("r", encoding="utf-8") as fp:
-                    history_lines = fp.readlines()
-            except Exception as e:
-                self.logger.error(f"读取历史记录失败: {e}")
+            history_lines = []
+            if self.history_path.exists():
+                try:
+                    with self.history_path.open("r", encoding="utf-8") as fp:
+                        history_lines = fp.readlines()
+                except Exception as e:
+                    self.logger.error(f"读取历史记录失败: {e}")
 
-        # 去重：检查最后一条记录是否与当前相同（排除fetched_at时间戳）
-        should_append = True
-        if history_lines:
-            try:
-                last_entry = json.loads(history_lines[-1])
-                # 比较除去fetched_at外的内容
-                last_comparison = {k: v for k, v in last_entry.items() if k != "fetched_at"}
-                current_comparison = {k: v for k, v in payload.items() if k != "fetched_at"}
-                if last_comparison == current_comparison:
-                    should_append = False
-                    self.logger.debug("历史记录已存在相同内容，跳过重复写入")
-            except Exception:
-                pass  # 解析失败则正常追加
+            # 去重：检查最后一条记录是否与当前相同（排除fetched_at时间戳）
+            should_append = True
+            if history_lines:
+                try:
+                    last_entry = json.loads(history_lines[-1])
+                    last_comparison = {k: v for k, v in last_entry.items() if k != "fetched_at"}
+                    current_comparison = {k: v for k, v in payload.items() if k != "fetched_at"}
+                    if last_comparison == current_comparison:
+                        should_append = False
+                        self.logger.debug("历史记录已存在相同内容，跳过重复写入")
+                except Exception:
+                    pass
 
-        if should_append:
-            history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
-            history_lines = history_lines[-1000:]
+            if should_append:
+                history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
+                history_lines = history_lines[-1000:]
 
-            try:
-                with self.history_path.open("w", encoding="utf-8") as fp:
-                    fp.writelines(history_lines)
-            except Exception as e:
-                self.logger.error(f"写入历史记录失败: {e}")
+                try:
+                    with self.history_path.open("w", encoding="utf-8") as fp:
+                        fp.writelines(history_lines)
+                except Exception as e:
+                    self.logger.error(f"写入历史记录失败: {e}")
 
     async def _dispatch_push(self, full_text: str, matched: list[str], push_interval: int):
         """向所有订阅者分发消息"""
@@ -606,9 +609,8 @@ class MerchantNotifyPlugin(Star):
                     chain.at_all()
                 chain.message(full_text)
 
-                success = await self._push_with_retry(umo, chain)
-                if success:
-                    await asyncio.sleep(push_interval)
+                await self._push_with_retry(umo, chain)
+                await asyncio.sleep(push_interval)
 
     async def _push_with_retry(self, umo: str, chain: MessageChain) -> bool:
         """推送单条消息，带重试机制。返回是否成功。"""
