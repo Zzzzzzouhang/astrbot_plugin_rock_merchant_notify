@@ -32,6 +32,9 @@ def _setup_file_logger(name: str, log_path: Path) -> logging.Logger:
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
+    # 禁止日志传播到父 logger,避免 AstrBot 主日志重复输出
+    logger.propagate = False
+
     return logger
 
 # ==================== 原版核心解析逻辑 ====================
@@ -160,6 +163,7 @@ class MerchantNotifyPlugin(Star):
         self.attempt_count = 0
         self.slot_success = False
         self.last_fetch_result = None  # 保存上一次抓取结果用于比较
+        self.last_pushed_payload = None  # 保存上一次已推送的payload，防止重复推送
 
         # 异步锁保护共享状态
         self._state_lock = asyncio.Lock()
@@ -229,6 +233,7 @@ class MerchantNotifyPlugin(Star):
                         self.attempt_count = 0
                         self.slot_success = False
                         self.last_fetch_result = None
+                        self.last_pushed_payload = None
                     else:
                         # 进入了一个新的时间窗口
                         if active_slot != self.current_active_slot:
@@ -236,6 +241,7 @@ class MerchantNotifyPlugin(Star):
                             self.attempt_count = 0
                             self.slot_success = False
                             self.last_fetch_result = None
+                            self.last_pushed_payload = None
                             self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
 
                         # 只有在未获取到新数据，且尝试次数没超限时，才执行抓取
@@ -253,11 +259,16 @@ class MerchantNotifyPlugin(Star):
                             else:
                                 # 第二次及以后：与上一次结果比较
                                 if comparable_payload(self.last_fetch_result) == comparable_payload(current_payload):
-                                    # 两次结果一致，说明网页已稳定，强制推送
-                                    self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
-                                    await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                    self.slot_success = True
-                                    self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
+                                    # 两次结果一致，说明网页已稳定，检查是否已推送过
+                                    if self.last_pushed_payload is None or comparable_payload(self.last_pushed_payload) != comparable_payload(current_payload):
+                                        self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
+                                        await self.process_and_push(current_payload, send_alert=True, force_save=True)
+                                        self.last_pushed_payload = current_payload
+                                        self.slot_success = True
+                                        self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
+                                    else:
+                                        self.logger.info(f"{active_slot} 结果已推送过，跳过重复推送")
+                                        self.slot_success = True
                                 else:
                                     # 结果不一致，更新缓存继续抓取
                                     self.last_fetch_result = current_payload
@@ -265,9 +276,13 @@ class MerchantNotifyPlugin(Star):
 
                                 # 达到最大次数兜底
                                 if self.attempt_count >= 5 and not self.slot_success:
-                                    # 使用最后一次结果推送
-                                    self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送")
-                                    await self.process_and_push(current_payload, send_alert=True, force_save=True)
+                                    # 检查是否已推送过
+                                    if self.last_pushed_payload is None or comparable_payload(self.last_pushed_payload) != comparable_payload(current_payload):
+                                        self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送")
+                                        await self.process_and_push(current_payload, send_alert=True, force_save=True)
+                                        self.last_pushed_payload = current_payload
+                                    else:
+                                        self.logger.info(f"{active_slot} 结果已推送过，跳过重复推送")
                                     self.slot_success = True
                                     self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
 
@@ -508,7 +523,6 @@ class MerchantNotifyPlugin(Star):
         """插件卸载时清理后台任务"""
         if hasattr(self, "_polling_task") and not self._polling_task.done():
             self._polling_task.cancel()
-            self.logger.info("已取消后台轮询任务")
 
     def _build_message(self, payload: dict[str, Any], display_time: datetime) -> tuple[str, list[str]]:
         """构建推送消息文本，返回 (完整消息, 匹配商品列表)"""
@@ -533,7 +547,7 @@ class MerchantNotifyPlugin(Star):
         return full_text, matched
 
     def _save_history(self, payload: dict[str, Any]):
-        """保存状态到 latest.json 并追加到 history.jsonl"""
+        """保存状态到 latest.json 并追加到 history.jsonl（带去重）"""
         self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         history_lines = []
@@ -544,14 +558,29 @@ class MerchantNotifyPlugin(Star):
             except Exception as e:
                 self.logger.error(f"读取历史记录失败: {e}")
 
-        history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
-        history_lines = history_lines[-1000:]
+        # 去重：检查最后一条记录是否与当前相同（排除fetched_at时间戳）
+        should_append = True
+        if history_lines:
+            try:
+                last_entry = json.loads(history_lines[-1])
+                # 比较除去fetched_at外的内容
+                last_comparison = {k: v for k, v in last_entry.items() if k != "fetched_at"}
+                current_comparison = {k: v for k, v in payload.items() if k != "fetched_at"}
+                if last_comparison == current_comparison:
+                    should_append = False
+                    self.logger.debug("历史记录已存在相同内容，跳过重复写入")
+            except Exception:
+                pass  # 解析失败则正常追加
 
-        try:
-            with self.history_path.open("w", encoding="utf-8") as fp:
-                fp.writelines(history_lines)
-        except Exception as e:
-            self.logger.error(f"写入历史记录失败: {e}")
+        if should_append:
+            history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
+            history_lines = history_lines[-1000:]
+
+            try:
+                with self.history_path.open("w", encoding="utf-8") as fp:
+                    fp.writelines(history_lines)
+            except Exception as e:
+                self.logger.error(f"写入历史记录失败: {e}")
 
     async def _dispatch_push(self, full_text: str, matched: list[str], push_interval: int):
         """向所有订阅者分发消息"""

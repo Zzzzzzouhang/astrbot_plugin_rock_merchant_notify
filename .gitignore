@@ -208,3 +208,6 @@ __marimo__/
 .qwen/settings.json
 .qwen/settings.json.orig
 test_main.py
+plugin_data/history.jsonl
+plugin_data/latest.json
+plugin_data/subscribers.json
