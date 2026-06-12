@@ -11,9 +11,15 @@
 
 import asyncio
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# 确保插件目录在 sys.path 中（AstrBot 动态加载时可能不在）
+_PLUGIN_DIR = str(Path(__file__).parent.resolve())
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
 
 from astrbot.api.all import Star, Context, register, command, AstrMessageEvent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
