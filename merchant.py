@@ -22,14 +22,20 @@ from bs4 import BeautifulSoup
 # ==================== 日志工具 ====================
 
 def setup_file_logger(name: str, log_path: Path) -> logging.Logger:
-    """为插件配置独立的文件日志，同时保留控制台输出。"""
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    """为插件配置独立的文件日志。
+
+    使用专属 logger 名称（{name}.file）避免与 AstrBot 框架的 logger 冲突。
+    """
+    # 使用独立名称，防止 AstrBot 框架覆盖 handler/level
+    logger = logging.getLogger(f"{name}.file")
+    logger.setLevel(logging.INFO)
+    logger.disabled = False
+    logger.propagate = False
 
     if not any(isinstance(h, logging.FileHandler) and getattr(h, "_plugin_log", False) for h in logger.handlers):
         fh = logging.FileHandler(log_path, encoding="utf-8")
         fh._plugin_log = True  # type: ignore[attr-defined]
-        fh.setLevel(logging.DEBUG)
+        fh.setLevel(logging.INFO)
         formatter = logging.Formatter(
             fmt="%(asctime)s [%(levelname)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
@@ -37,7 +43,6 @@ def setup_file_logger(name: str, log_path: Path) -> logging.Logger:
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
-    logger.propagate = False
     return logger
 
 
@@ -224,7 +229,7 @@ class MerchantMonitor:
                 if flag_file != current_flag:
                     flag_file.unlink()
         except Exception as e:
-            self.logger.debug(f"清理旧窗口标记文件失败: {e}")
+            self.logger.warning(f"清理旧窗口标记文件失败: {e}")
 
     def _try_claim_window_push(self, slot_key: str) -> bool:
         """原子性抢占窗口推送权（O_CREAT|O_EXCL），跨进程/跨模块只有一方成功"""
@@ -267,7 +272,7 @@ class MerchantMonitor:
                 if current_id == self._instance_id:
                     owner_path.unlink()
         except Exception as e:
-            self.logger.debug(f"释放轮询所有权失败: {e}")
+            self.logger.warning(f"释放轮询所有权失败: {e}")
 
     # ---------- 抓取与比对 ----------
 

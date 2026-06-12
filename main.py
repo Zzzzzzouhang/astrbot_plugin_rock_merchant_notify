@@ -46,8 +46,11 @@ class MerchantNotifyPlugin(Star):
         self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / self.name
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        # 日志
+        # 日志（使用独立 logger 名称，避免与 AstrBot 冲突）
         self.logger = setup_file_logger(self.name, self.data_dir / "merchant.log")
+        self.logger.info(f"插件实例已启动，日志路径: {self.data_dir / 'merchant.log'}")
+        for h in self.logger.handlers:
+            h.flush()
 
         # 订阅者
         self.subscribers_path = self.data_dir / "subscribers.json"
