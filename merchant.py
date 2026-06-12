@@ -440,6 +440,12 @@ class MerchantMonitor:
                         self._last_fetch_result = None
                         self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
                         self._cleanup_window_flags(active_slot)
+                    
+                        # 插件重启场景：内存状态已丢失，清除本窗口 flag 以允许重新建立基准
+                        flag_path = self._window_flag_path(active_slot)
+                        if flag_path.exists() and self._last_fetch_result is None:
+                            flag_path.unlink(missing_ok=True)
+                            self.logger.info(f"插件重启检测到 flag 但无内存基准，已清除 flag，将重新抓取")
 
                     flag_path = self._window_flag_path(active_slot)
                     if flag_path.exists():
