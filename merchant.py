@@ -420,6 +420,7 @@ class MerchantMonitor:
         while True:
             # 多适配器共存时，只允许一个实例轮询
             if not self._is_poll_owner():
+                self.logger.info(f"[诊断] 实例 {self._instance_id[:8]} 不是 poll owner，sleep 120s")
                 await asyncio.sleep(120)
                 continue
 
@@ -447,11 +448,15 @@ class MerchantMonitor:
                             flag_path.unlink(missing_ok=True)
                             self.logger.info(f"插件重启检测到 flag 但无内存基准，已清除 flag，将重新抓取")
 
+                        flag_check = self._window_flag_path(active_slot)
+                        self.logger.info(f"[诊断] 窗口重置完成: flag_exists={flag_check.exists()}, attempt={self._attempt_count}, slot={active_slot}")
+
                     flag_path = self._window_flag_path(active_slot)
                     if flag_path.exists():
-                        pass  # 本窗口已推送过
+                        self.logger.info(f"[诊断] {active_slot} flag已存在，本窗口已推送过，跳过")
                     elif self._attempt_count < 5:
                         self._attempt_count += 1
+                        self.logger.info(f"[诊断] 准备第 {self._attempt_count}/5 次抓取，attempt_count={self._attempt_count}")
                         self.logger.info(f"正在执行 {active_slot} 窗口期的第 {self._attempt_count}/5 次抓取检测...")
 
                         try:
@@ -496,6 +501,7 @@ class MerchantMonitor:
                 self.logger.error(f"Polling error: {e}", exc_info=True)
 
             await asyncio.sleep(120)
+            self.logger.info("[诊断] sleep(120) 完成，开始下一轮循环")
 
     # ---------- 生命周期 ----------
 
