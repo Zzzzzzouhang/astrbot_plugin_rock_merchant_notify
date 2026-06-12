@@ -211,3 +211,4 @@ test_main.py
 plugin_data/history.jsonl
 plugin_data/latest.json
 plugin_data/subscribers.json
+plugin_data/.poll_pushed_*.flag

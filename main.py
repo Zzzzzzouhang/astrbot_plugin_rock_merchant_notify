@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -135,13 +136,11 @@ def has_changed(previous: dict[str, Any] | None, current: dict[str, Any]) -> boo
     return comparable_payload(previous) != comparable_payload(current)
 
 
-# ==================== 模块级共享轮询状态（防多实例重复抓取） ====================
+# ==================== 模块级共享轮询状态（同模块内防重复） ====================
+# 注意：AstrBot 热重载插件时会创建新模块，模块级全局变量会重置。
+# 因此跨重载的防重复依赖文件级标记（_window_flag_path），不依赖此处全局。
 _shared_poll_lock = asyncio.Lock()
-_shared_active_slot: str | None = None
-_shared_attempt_count: int = 0
-_shared_slot_success: bool = False
 _shared_last_fetch_result: dict[str, Any] | None = None
-_shared_last_pushed_payload: dict[str, Any] | None = None
 
 # ==================== AstrBot 插件实体 ====================
 
@@ -166,7 +165,10 @@ class MerchantNotifyPlugin(Star):
 
         self.subscribers = self._load_subscribers()
 
-        # 轮询状态已迁移至模块级共享变量 _shared_* ，避免多实例重复抓取
+        # 轮询状态：_active_slot / _attempt_count 为本轮询任务本地状态
+        # 跨模块重载的推送防重复依赖文件级标记 _window_flag_path
+        self._active_slot: str | None = None
+        self._attempt_count: int = 0
         # 文件写入锁，防止并发写 history / subscribers
         self._file_lock = asyncio.Lock()
 
@@ -220,10 +222,42 @@ class MerchantNotifyPlugin(Star):
                 return item
         return None
 
+    def _window_flag_path(self, slot_key: str) -> Path:
+        """返回指定窗口槽位的推送标记文件路径（跨模块重载有效）"""
+        today = datetime.now(ZoneInfo(self.timezone)).strftime("%Y%m%d")
+        safe_slot = slot_key.replace(":", "")
+        return self.data_dir / f".poll_pushed_{today}_{safe_slot}.flag"
+
+    def _cleanup_window_flags(self, current_slot: str) -> None:
+        """清理旧窗口的标记文件，保留当前窗口的标记"""
+        current_flag = self._window_flag_path(current_slot)
+        try:
+            for flag_file in self.data_dir.glob(".poll_pushed_*.flag"):
+                if flag_file != current_flag:
+                    flag_file.unlink()
+        except Exception as e:
+            self.logger.debug(f"清理旧窗口标记文件失败: {e}")
+
+    def _try_claim_window_push(self, slot_key: str) -> bool:
+        """原子性地抢占窗口推送权：使用 O_CREAT|O_EXCL 保证跨进程/跨模块只有一方成功。
+        返回 True 表示本次调用获得了推送权，False 表示已被其他任务抢占。
+        """
+        flag_path = self._window_flag_path(slot_key)
+        try:
+            fd = os.open(str(flag_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                now = datetime.now(ZoneInfo(self.timezone)).isoformat()
+                f.write(json.dumps({"slot": slot_key, "pushed_at": now}, ensure_ascii=False))
+            return True
+        except FileExistsError:
+            return False
+        except Exception as e:
+            self.logger.warning(f"创建窗口标记文件失败: {e}")
+            return False
+
     async def poll_loop(self):
-        """后台轮询任务，使用模块级共享状态确保多实例下仅一份抓取逻辑运行"""
-        global _shared_active_slot, _shared_attempt_count, _shared_slot_success
-        global _shared_last_fetch_result, _shared_last_pushed_payload
+        """后台轮询任务：使用文件级窗口标记防止跨模块重载重复推送"""
+        global _shared_last_fetch_result
 
         while True:
             try:
@@ -232,65 +266,72 @@ class MerchantNotifyPlugin(Star):
 
                 async with _shared_poll_lock:
                     if not active_slot:
-                        # 不在任何窗口期，清理状态并保持沉睡
-                        if _shared_active_slot is not None:
+                        # 不在任何窗口期，清理本地状态并保持沉睡
+                        if self._active_slot is not None:
                             self.logger.info("窗口期结束，清理轮询状态")
-                        _shared_active_slot = None
-                        _shared_attempt_count = 0
-                        _shared_slot_success = False
+                        self._active_slot = None
+                        self._attempt_count = 0
                         _shared_last_fetch_result = None
-                        _shared_last_pushed_payload = None
                     else:
                         # 进入了一个新的时间窗口
-                        if active_slot != _shared_active_slot:
-                            _shared_active_slot = active_slot
-                            _shared_attempt_count = 0
-                            _shared_slot_success = False
+                        if active_slot != self._active_slot:
+                            self._active_slot = active_slot
+                            self._attempt_count = 0
                             _shared_last_fetch_result = None
-                            _shared_last_pushed_payload = None
                             self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
+                            # 清理旧窗口的标记文件（不影响当前窗口）
+                            self._cleanup_window_flags(active_slot)
 
-                        # 只有在未获取到新数据，且尝试次数没超限时，才执行抓取
-                        if not _shared_slot_success and _shared_attempt_count < 5:
-                            _shared_attempt_count += 1
-                            self.logger.info(f"正在执行 {active_slot} 窗口期的第 {_shared_attempt_count}/5 次抓取检测...")
+                        # 检查本窗口是否已推送（文件级标记，跨模块重载有效）
+                        flag_path = self._window_flag_path(active_slot)
+                        if flag_path.exists():
+                            # 本窗口已推送过，直接跳过
+                            pass
+                        elif self._attempt_count < 5:
+                            self._attempt_count += 1
+                            self.logger.info(f"正在执行 {active_slot} 窗口期的第 {self._attempt_count}/5 次抓取检测...")
 
-                            # 执行抓取但不立即推送，仅获取数据
-                            current_payload, _ = await self.execute_fetch_only()
+                            try:
+                                current_payload, _ = await self.execute_fetch_only()
+                            except Exception as fetch_err:
+                                self.logger.warning(f"{active_slot} 第 {self._attempt_count} 次抓取失败: {fetch_err}，等待下次重试")
+                                # 抓取失败：不更新基准，attempt_count 已递增，等待下次重试
+                                current_payload = None
 
-                            # 第一次抓取：保存结果，继续下一次
-                            if _shared_attempt_count == 1:
+                            if current_payload is None:
+                                # 抓取失败，本轮跳过，等待下次循环重试
+                                pass
+                            elif self._attempt_count == 1:
+                                # 第一次抓取：保存结果，继续下一次
                                 _shared_last_fetch_result = current_payload
                                 self.logger.info(f"{active_slot} 第1次抓取完成，等待下次抓取比对...")
                             else:
-                                # 第二次及以后：与上一次结果比较
-                                if comparable_payload(_shared_last_fetch_result) == comparable_payload(current_payload):
-                                    # 两次结果一致，说明网页已稳定，检查是否已推送过
-                                    if _shared_last_pushed_payload is None or comparable_payload(_shared_last_pushed_payload) != comparable_payload(current_payload):
+                                # 第二次及以后：与上一次结果比较（None 守卫）
+                                last_result = _shared_last_fetch_result
+                                if last_result is not None and comparable_payload(last_result) == comparable_payload(current_payload):
+                                    # 两次结果一致，说明网页已稳定，原子性抢占推送权
+                                    if self._try_claim_window_push(active_slot):
                                         self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
                                         await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                        _shared_last_pushed_payload = current_payload
-                                        _shared_slot_success = True
                                         self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
                                     else:
-                                        self.logger.info(f"{active_slot} 结果已推送过，跳过重复推送")
-                                        _shared_slot_success = True
+                                        self.logger.info(f"{active_slot} 本窗口已被其他任务推送，跳过")
                                 else:
-                                    # 结果不一致，更新缓存继续抓取
+                                    # 结果不一致或上次结果为 None，更新缓存继续抓取
                                     _shared_last_fetch_result = current_payload
-                                    self.logger.info(f"{active_slot} 第 {_shared_attempt_count} 次抓取结果与上次不一致，继续比对...")
+                                    if last_result is None:
+                                        self.logger.info(f"{active_slot} 第 {self._attempt_count} 次抓取，上次结果丢失，重新建立基准...")
+                                    else:
+                                        self.logger.info(f"{active_slot} 第 {self._attempt_count} 次抓取结果与上次不一致，继续比对...")
 
                                 # 达到最大次数兜底
-                                if _shared_attempt_count >= 5 and not _shared_slot_success:
-                                    # 检查是否已推送过
-                                    if _shared_last_pushed_payload is None or comparable_payload(_shared_last_pushed_payload) != comparable_payload(current_payload):
-                                        self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果推送")
+                                if self._attempt_count >= 5 and not flag_path.exists():
+                                    if self._try_claim_window_push(active_slot):
+                                        self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果兜底推送")
                                         await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                        _shared_last_pushed_payload = current_payload
+                                        self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
                                     else:
-                                        self.logger.info(f"{active_slot} 结果已推送过，跳过重复推送")
-                                    _shared_slot_success = True
-                                    self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
+                                        self.logger.info(f"{active_slot} 本窗口已被其他任务推送，跳过兜底")
 
             except asyncio.CancelledError:
                 self.logger.info("轮询任务被取消，正常退出")
@@ -298,7 +339,7 @@ class MerchantNotifyPlugin(Star):
             except Exception as e:
                 self.logger.error(f"Polling error: {e}", exc_info=True)
 
-            # 基础周期改为2分钟
+            # 基础周期2分钟
             await asyncio.sleep(120)
 
     async def execute_fetch_only(self) -> tuple[dict[str, Any], bool]:
@@ -565,18 +606,19 @@ class MerchantNotifyPlugin(Star):
                 except Exception as e:
                     self.logger.error(f"读取历史记录失败: {e}")
 
-            # 去重：检查最后一条记录是否与当前相同（排除fetched_at时间戳）
+            # 去重：使用 comparable_payload 归一化后，检查最近 5 条记录是否已有相同内容
             should_append = True
-            if history_lines:
+            current_comparable = comparable_payload(payload)
+            check_count = min(len(history_lines), 5)
+            for i in range(len(history_lines) - check_count, len(history_lines)):
                 try:
-                    last_entry = json.loads(history_lines[-1])
-                    last_comparison = {k: v for k, v in last_entry.items() if k != "fetched_at"}
-                    current_comparison = {k: v for k, v in payload.items() if k != "fetched_at"}
-                    if last_comparison == current_comparison:
+                    entry = json.loads(history_lines[i])
+                    if comparable_payload(entry) == current_comparable:
                         should_append = False
                         self.logger.debug("历史记录已存在相同内容，跳过重复写入")
+                        break
                 except Exception:
-                    pass
+                    continue
 
             if should_append:
                 history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -635,10 +677,27 @@ class MerchantNotifyPlugin(Star):
 
     @command("远行商人")
     async def manual_check(self, event: AstrMessageEvent):
-        """机器人快捷指令：手动触发并获取当前商品列表"""
+        """机器人快捷指令：直接返回当前缓存的商品数据，无缓存时实时抓取"""
         try:
-            # 手动执行不走轮询次数限制，也默认不发全群广播，仅回复当前用户
-            result_msg, _ = await self.execute_check(send_alert=False)
+            payload = None
+            # 优先读取缓存数据，快速响应
+            if self.state_path.exists():
+                try:
+                    payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+                except Exception as e:
+                    self.logger.warning(f"读取缓存失败，降级为实时抓取: {e}")
+
+            if payload is None:
+                # 无缓存，实时抓取
+                result_msg, _ = await self.execute_check(send_alert=False)
+            else:
+                # 使用缓存数据直接构建消息
+                try:
+                    display_time = datetime.fromisoformat(payload.get("fetched_at", ""))
+                except Exception:
+                    display_time = datetime.now(ZoneInfo(self.timezone))
+                result_msg, _ = self._build_message(payload, display_time)
+
             yield event.plain_result(result_msg + self.HINT_LINE)
         except Exception as e:
             self.logger.error(f"手动查询异常: {e}", exc_info=True)
