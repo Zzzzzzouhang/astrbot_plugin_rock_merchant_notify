@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -172,6 +173,14 @@ class MerchantNotifyPlugin(Star):
         # 文件写入锁，防止并发写 history / subscribers
         self._file_lock = asyncio.Lock()
 
+        # 实例身份标识：每个实例生成唯一 ID，写入文件。
+        # 轮询任务每次循环检查此 ID，若文件已被新实例覆盖则自动退出。
+        # 此机制可清理 terminate() 修复前遗留的孤儿任务。
+        self._instance_id = str(uuid.uuid4())
+        self._instance_id_path = self.data_dir / ".active_instance"
+        self._instance_id_path.write_text(self._instance_id, encoding="utf-8")
+        self.logger.info(f"插件实例已启动，instance_id={self._instance_id[:8]}")
+
         # 启动后台定时轮询任务
         self._polling_task = asyncio.create_task(self.poll_loop())
 
@@ -255,11 +264,27 @@ class MerchantNotifyPlugin(Star):
             self.logger.warning(f"创建窗口标记文件失败: {e}")
             return False
 
+    def _is_active_instance(self) -> bool:
+        """检查当前实例是否仍为活跃实例（.active_instance 文件 ID 匹配）。
+        若文件被新实例覆盖，说明当前实例已过期，应自动退出。
+        """
+        try:
+            current_id = self._instance_id_path.read_text(encoding="utf-8").strip()
+            return current_id == self._instance_id
+        except Exception:
+            # 文件不存在或读取失败，保守认为仍活跃（不退出）
+            return True
+
     async def poll_loop(self):
         """后台轮询任务：使用文件级窗口标记防止跨模块重载重复推送"""
         global _shared_last_fetch_result
 
         while True:
+            # 检查当前实例是否已被新实例取代（孤儿任务自动退出）
+            if not self._is_active_instance():
+                self.logger.info(f"检测到新实例已启动，本孤儿任务自动退出 (instance_id={self._instance_id[:8]})")
+                break
+
             try:
                 current_time = datetime.now(ZoneInfo(self.timezone))
                 active_slot = self.get_active_slot(current_time)
