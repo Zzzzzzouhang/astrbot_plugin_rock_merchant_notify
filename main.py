@@ -566,10 +566,15 @@ class MerchantNotifyPlugin(Star):
         status_names = {0: "不@全员", 1: "@全员"}
         yield event.plain_result(f"✅ 设置成功！当前群聊的艾特状态已修改为：【{status_names[status_int]}】" + self.HINT_LINE)
 
-    def cleanup(self):
-        """插件卸载时清理后台任务"""
+    async def terminate(self):
+        """插件卸载/停用/重载时由 AstrBot 调用，取消后台轮询任务"""
         if hasattr(self, "_polling_task") and not self._polling_task.done():
             self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.info("轮询任务已取消，插件卸载完成")
 
     def _build_message(self, payload: dict[str, Any], display_time: datetime) -> tuple[str, list[str]]:
         """构建推送消息文本，返回 (完整消息, 匹配商品列表)"""
