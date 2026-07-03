@@ -8,9 +8,6 @@
 import asyncio
 import json
 import logging
-import os
-import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -186,9 +183,10 @@ class MerchantMonitor:
         # 文件写入锁
         self._file_lock = asyncio.Lock()
 
-        # 实例身份标识（用于多适配器所有权协商）
-        self._instance_id = str(uuid.uuid4())
-        self.logger.info(f"MerchantMonitor 已启动，instance_id={self._instance_id[:8]}")
+        # 清理上一个实例可能遗留的 owner 文件（插件重载场景）
+        self._cleanup_orphan_owner()
+
+        self.logger.info("MerchantMonitor 已启动")
 
         # 启动后台轮询
         self._polling_task = asyncio.create_task(self.poll_loop())
@@ -216,88 +214,24 @@ class MerchantMonitor:
                 return item
         return None
 
-    # ---------- 所有权与窗口标记 ----------
+    # ---------- 实例生命周期 ----------
+
+    def _cleanup_orphan_owner(self) -> None:
+        """启动时清理上一个实例可能遗留的 stop_flag"""
+        flag_path = self.data_dir / ".stop_flag"
+        if flag_path.exists():
+            try:
+                flag_path.unlink()
+                self.logger.info("已清理上一个实例的 stop_flag")
+            except Exception:
+                pass
+
+    # ---------- 窗口标记 ----------
 
     def _window_flag_path(self, slot_key: str) -> Path:
         today = datetime.now(ZoneInfo(self.timezone)).strftime("%Y%m%d")
         safe_slot = slot_key.replace(":", "")
         return self.data_dir / f".poll_pushed_{today}_{safe_slot}.flag"
-
-    def _cleanup_window_flags(self, current_slot: str) -> None:
-        current_flag = self._window_flag_path(current_slot)
-        try:
-            for flag_file in self.data_dir.glob(".poll_pushed_*.flag"):
-                if flag_file != current_flag:
-                    flag_file.unlink()
-        except Exception as e:
-            self.logger.warning(f"清理旧窗口标记文件失败: {e}")
-
-    def _try_claim_window_push(self, slot_key: str) -> bool:
-        """原子性抢占窗口推送权（O_CREAT|O_EXCL），跨进程/跨模块只有一方成功"""
-        flag_path = self._window_flag_path(slot_key)
-        try:
-            fd = os.open(str(flag_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                now = datetime.now(ZoneInfo(self.timezone)).isoformat()
-                f.write(json.dumps({"slot": slot_key, "pushed_at": now}, ensure_ascii=False))
-            return True
-        except FileExistsError:
-            return False
-        except Exception as e:
-            self.logger.warning(f"创建窗口标记文件失败: {e}")
-            return False
-
-    def _is_poll_owner(self) -> bool:
-        """尝试获取或确认轮询所有权，多实例中只有一个返回 True。
-        
-        如果检测到 owner 文件超过 300 秒未刷新（说明原实例已崩溃/重启），
-        新实例可以强制抢占所有权。
-        """
-        owner_path = self.data_dir / ".poll_owner"
-        try:
-            fd = os.open(str(owner_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(self._instance_id)
-            return True
-        except FileExistsError:
-            try:
-                current_id = owner_path.read_text(encoding="utf-8").strip()
-                if current_id == self._instance_id:
-                    # 当前实例即是 owner，更新文件 mtime 表示存活
-                    owner_path.touch()
-                    return True
-                # ID 不匹配，检查文件是否过期（> 300 秒）
-                stale_seconds = time.time() - owner_path.stat().st_mtime
-                if stale_seconds > 300:
-                    self.logger.warning(
-                        f"检测到过期 owner 文件（{stale_seconds:.0f}s 未刷新），"
-                        f"原实例可能已崩溃，强制抢占所有权"
-                    )
-                    owner_path.unlink()
-                    fd = os.open(str(owner_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write(self._instance_id)
-                    return True
-                self.logger.info(
-                    f"实例 {self._instance_id[:8]} 不是 poll owner，"
-                    f"当前 owner={current_id[:8]}，文件距今 {stale_seconds:.0f}s"
-                )
-                return False
-            except Exception:
-                return False
-        except Exception as e:
-            self.logger.warning(f"检查轮询所有权失败: {e}")
-            return False
-
-    def _release_poll_ownership(self) -> None:
-        owner_path = self.data_dir / ".poll_owner"
-        try:
-            if owner_path.exists():
-                current_id = owner_path.read_text(encoding="utf-8").strip()
-                if current_id == self._instance_id:
-                    owner_path.unlink()
-        except Exception as e:
-            self.logger.warning(f"释放轮询所有权失败: {e}")
 
     # ---------- 抓取与比对 ----------
 
@@ -441,13 +375,14 @@ class MerchantMonitor:
     # ---------- 轮询主循环 ----------
 
     async def poll_loop(self):
-        """后台轮询：文件级所有权协商 + 窗口标记防重复"""
+        """后台轮询：在窗口期内定时抓取，数据稳定后推送"""
+        stop_flag_path = self.data_dir / ".stop_flag"
+        
         while True:
-            # 多适配器共存时，只允许一个实例轮询
-            if not self._is_poll_owner():
-                self.logger.info(f"[诊断] 实例 {self._instance_id[:8]} 不是 poll owner，sleep 120s")
-                await asyncio.sleep(120)
-                continue
+            # 检查是否已被要求停止
+            if stop_flag_path.exists():
+                self.logger.info("检测到 stop_flag，轮询退出")
+                break
 
             try:
                 current_time = datetime.now(ZoneInfo(self.timezone))
@@ -465,24 +400,13 @@ class MerchantMonitor:
                         self._attempt_count = 0
                         self._last_fetch_result = None
                         self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
-                        self._cleanup_window_flags(active_slot)
-                    
-                        # 插件重启场景：内存状态已丢失，清除本窗口 flag 以允许重新建立基准
-                        flag_path = self._window_flag_path(active_slot)
-                        if flag_path.exists() and self._last_fetch_result is None:
-                            flag_path.unlink(missing_ok=True)
-                            self.logger.info(f"插件重启检测到 flag 但无内存基准，已清除 flag，将重新抓取")
-
-                        flag_check = self._window_flag_path(active_slot)
-                        self.logger.info(f"[诊断] 窗口重置完成: flag_exists={flag_check.exists()}, attempt={self._attempt_count}, slot={active_slot}")
 
                     flag_path = self._window_flag_path(active_slot)
                     if flag_path.exists():
-                        self.logger.info(f"[诊断] {active_slot} flag已存在，本窗口已推送过，跳过")
+                        self.logger.info(f"{active_slot} 本窗口已推送过，跳过")
                     elif self._attempt_count < 5:
                         self._attempt_count += 1
-                        self.logger.info(f"[诊断] 准备第 {self._attempt_count}/5 次抓取，attempt_count={self._attempt_count}")
-                        self.logger.info(f"正在执行 {active_slot} 窗口期的第 {self._attempt_count}/5 次抓取检测...")
+                        self.logger.info(f"{active_slot} 窗口期第 {self._attempt_count}/5 次抓取检测...")
 
                         try:
                             current_payload, _ = await self.execute_fetch_only()
@@ -491,11 +415,9 @@ class MerchantMonitor:
                             current_payload = None
 
                         if current_payload is None:
-                            # 抓取失败，检查是否已达到最大重试次数
                             if self._attempt_count >= 5:
                                 self.logger.warning(
-                                    f"{active_slot} 窗口期内所有 {self._attempt_count} 次抓取均失败，"
-                                    f"本窗口放弃重试，等待下一个窗口期"
+                                    f"{active_slot} 窗口期内所有抓取均失败，本窗口放弃，等待下一个窗口期"
                                 )
                         elif self._attempt_count == 1:
                             self._last_fetch_result = current_payload
@@ -503,12 +425,11 @@ class MerchantMonitor:
                         else:
                             last_result = self._last_fetch_result
                             if last_result is not None and comparable_payload(last_result) == comparable_payload(current_payload):
-                                if self._try_claim_window_push(active_slot):
-                                    self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
-                                    await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                    self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
-                                else:
-                                    self.logger.info(f"{active_slot} 本窗口已被其他任务推送，跳过")
+                                # 创建 flag 防止重复推送
+                                self._create_push_flag(flag_path, active_slot)
+                                self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
+                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
+                                self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
                             else:
                                 self._last_fetch_result = current_payload
                                 if last_result is None:
@@ -517,16 +438,13 @@ class MerchantMonitor:
                                     self.logger.info(f"{active_slot} 第 {self._attempt_count} 次抓取结果与上次不一致，继续比对...")
 
                             if self._attempt_count >= 5 and not flag_path.exists():
-                                if self._try_claim_window_push(active_slot):
-                                    self.logger.info(f"{active_slot} 已达到最大检测次数限制 5，使用最后一次结果兜底推送")
-                                    await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                    self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
-                                else:
-                                    self.logger.info(f"{active_slot} 本窗口已被其他任务推送，跳过兜底")
+                                self._create_push_flag(flag_path, active_slot)
+                                self.logger.info(f"{active_slot} 已达到最大检测次数，使用最后一次结果兜底推送")
+                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
+                                self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
                     else:
-                        # _attempt_count >= 5 且 flag 不存在 → 所有抓取均失败，窗口期放弃
                         self.logger.info(
-                            f"{active_slot} 已达最大重试次数（{self._attempt_count}），本窗口不再重试，等待新窗口"
+                            f"{active_slot} 已达最大重试次数，本窗口不再重试，等待新窗口"
                         )
 
             except asyncio.CancelledError:
@@ -536,17 +454,39 @@ class MerchantMonitor:
                 self.logger.error(f"Polling error: {e}", exc_info=True)
 
             await asyncio.sleep(120)
-            self.logger.info("[诊断] sleep(120) 完成，开始下一轮循环")
+
+    def _create_push_flag(self, flag_path: Path, slot_key: str) -> None:
+        """创建窗口推送标记文件"""
+        try:
+            flag_path.write_text(json.dumps({
+                "slot": slot_key,
+                "pushed_at": datetime.now(ZoneInfo(self.timezone)).isoformat()
+            }, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            self.logger.warning(f"创建推送标记文件失败: {e}")
 
     # ---------- 生命周期 ----------
 
     async def stop(self):
         """停止轮询并释放资源"""
+        # 写入 stop_flag 通知 poll_loop 退出
+        stop_flag_path = self.data_dir / ".stop_flag"
+        try:
+            stop_flag_path.write_text("1", encoding="utf-8")
+        except Exception:
+            pass
+
         if hasattr(self, "_polling_task") and not self._polling_task.done():
             self._polling_task.cancel()
             try:
                 await self._polling_task
             except asyncio.CancelledError:
                 pass
-        self._release_poll_ownership()
+
+        # 清理 stop_flag
+        try:
+            stop_flag_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
         self.logger.info("轮询任务已取消，Monitor 已停止")
