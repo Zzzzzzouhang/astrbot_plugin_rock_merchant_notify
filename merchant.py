@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -247,7 +248,11 @@ class MerchantMonitor:
             return False
 
     def _is_poll_owner(self) -> bool:
-        """尝试获取或确认轮询所有权，多实例中只有一个返回 True"""
+        """尝试获取或确认轮询所有权，多实例中只有一个返回 True。
+        
+        如果检测到 owner 文件超过 300 秒未刷新（说明原实例已崩溃/重启），
+        新实例可以强制抢占所有权。
+        """
         owner_path = self.data_dir / ".poll_owner"
         try:
             fd = os.open(str(owner_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -257,7 +262,27 @@ class MerchantMonitor:
         except FileExistsError:
             try:
                 current_id = owner_path.read_text(encoding="utf-8").strip()
-                return current_id == self._instance_id
+                if current_id == self._instance_id:
+                    # 当前实例即是 owner，更新文件 mtime 表示存活
+                    owner_path.touch()
+                    return True
+                # ID 不匹配，检查文件是否过期（> 300 秒）
+                stale_seconds = time.time() - owner_path.stat().st_mtime
+                if stale_seconds > 300:
+                    self.logger.warning(
+                        f"检测到过期 owner 文件（{stale_seconds:.0f}s 未刷新），"
+                        f"原实例可能已崩溃，强制抢占所有权"
+                    )
+                    owner_path.unlink()
+                    fd = os.open(str(owner_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(self._instance_id)
+                    return True
+                self.logger.info(
+                    f"实例 {self._instance_id[:8]} 不是 poll owner，"
+                    f"当前 owner={current_id[:8]}，文件距今 {stale_seconds:.0f}s"
+                )
+                return False
             except Exception:
                 return False
         except Exception as e:
@@ -353,10 +378,10 @@ class MerchantMonitor:
                 except Exception as e:
                     self.logger.error(f"读取历史记录失败: {e}")
 
-            # 去重：使用 comparable_payload 归一化后，检查最近 5 条
+            # 去重：使用 comparable_payload 归一化后，在最近 20 条中检查
             should_append = True
             current_comparable = comparable_payload(payload)
-            check_count = min(len(history_lines), 5)
+            check_count = min(len(history_lines), 20)
             for i in range(len(history_lines) - check_count, len(history_lines)):
                 try:
                     entry = json.loads(history_lines[i])
@@ -466,7 +491,12 @@ class MerchantMonitor:
                             current_payload = None
 
                         if current_payload is None:
-                            pass  # 抓取失败，本轮跳过
+                            # 抓取失败，检查是否已达到最大重试次数
+                            if self._attempt_count >= 5:
+                                self.logger.warning(
+                                    f"{active_slot} 窗口期内所有 {self._attempt_count} 次抓取均失败，"
+                                    f"本窗口放弃重试，等待下一个窗口期"
+                                )
                         elif self._attempt_count == 1:
                             self._last_fetch_result = current_payload
                             self.logger.info(f"{active_slot} 第1次抓取完成，等待下次抓取比对...")
@@ -493,6 +523,11 @@ class MerchantMonitor:
                                     self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
                                 else:
                                     self.logger.info(f"{active_slot} 本窗口已被其他任务推送，跳过兜底")
+                    else:
+                        # _attempt_count >= 5 且 flag 不存在 → 所有抓取均失败，窗口期放弃
+                        self.logger.info(
+                            f"{active_slot} 已达最大重试次数（{self._attempt_count}），本窗口不再重试，等待新窗口"
+                        )
 
             except asyncio.CancelledError:
                 self.logger.info("轮询任务被取消，正常退出")
