@@ -23,23 +23,28 @@ def setup_file_logger(name: str, log_path: Path) -> logging.Logger:
     """为插件配置独立的文件日志。
 
     使用专属 logger 名称（{name}.file）避免与 AstrBot 框架的 logger 冲突。
+    每次调用都会清理旧的 handler 并重新创建，确保日志写入正确的文件路径。
     """
-    # 使用独立名称，防止 AstrBot 框架覆盖 handler/level
-    logger = logging.getLogger(f"{name}.file")
+    logger_name = f"{name}.file"
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
     logger.disabled = False
     logger.propagate = False
 
-    if not any(isinstance(h, logging.FileHandler) and getattr(h, "_plugin_log", False) for h in logger.handlers):
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh._plugin_log = True  # type: ignore[attr-defined]
-        fh.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
+    # 移除所有旧的 FileHandler，避免指向已删除的旧文件
+    for h in list(logger.handlers):
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            logger.removeHandler(h)
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
 
     return logger
 
