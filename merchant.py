@@ -175,11 +175,13 @@ class MerchantMonitor:
         self._attempt_count: int = 0
         self._last_fetch_result: dict[str, Any] | None = None
 
+        # 内存标记：窗口推送去重（格式 "YYYYMMDD_slot"，重载自然清空）
+        self._pushed_windows: set[str] = set()
+        # 停止标志
+        self._stopped: bool = False
+
         # 文件写入锁
         self._file_lock = asyncio.Lock()
-
-        # 清理上一个实例可能遗留的 owner 文件（插件重载场景）
-        self._cleanup_orphan_owner()
 
         self.logger.info("MerchantMonitor 已启动")
 
@@ -209,29 +211,22 @@ class MerchantMonitor:
                 return item
         return None
 
-    # ---------- 实例生命周期 ----------
+    # ---------- 窗口标记（内存版，重载自然清空）----------
 
-    def _cleanup_orphan_owner(self) -> None:
-        """启动时清理上一个实例可能遗留的 stop_flag"""
-        flag_path = self.data_dir / ".stop_flag"
-        if flag_path.exists():
-            try:
-                flag_path.unlink()
-                self.logger.info("已清理上一个实例的 stop_flag")
-            except Exception:
-                pass
-
-    # ---------- 窗口标记 ----------
-
-    def _window_flag_path(self, slot_key: str) -> Path:
+    def _window_key(self, slot: str) -> str:
         today = datetime.now(ZoneInfo(self.timezone)).strftime("%Y%m%d")
-        safe_slot = slot_key.replace(":", "")
-        return self.data_dir / f".poll_pushed_{today}_{safe_slot}.flag"
+        return f"{today}_{slot}"
 
-    # ---------- 抓取与比对 ----------
+    def _is_window_pushed(self, slot: str) -> bool:
+        return self._window_key(slot) in self._pushed_windows
 
-    async def execute_fetch_only(self) -> tuple[dict[str, Any], bool]:
-        """抓取并解析页面，返回 (payload, changed)"""
+    def _mark_window_pushed(self, slot: str) -> None:
+        self._pushed_windows.add(self._window_key(slot))
+
+    # ---------- 抓取 ----------
+
+    async def fetch(self) -> dict[str, Any]:
+        """纯抓取+解析，返回 payload（不含比对的单次抓取）"""
         current_time = datetime.now(ZoneInfo(self.timezone))
         url = self.config.get("merchant_url", "")
         if not url:
@@ -240,33 +235,31 @@ class MerchantMonitor:
         html = await asyncio.to_thread(fetch_page, url)
         parsed = await asyncio.to_thread(parse_items, html)
 
-        payload = {
+        return {
             "fetched_at": current_time.isoformat(),
             "slot": parsed["slot"],
             "items": parsed["items"],
         }
 
+    async def execute_fetch_only(self) -> tuple[dict[str, Any], bool]:
+        """兼容包装：抓取并返回 (payload, changed)。供 main.py 手动查询使用。"""
+        payload = await self.fetch()
         previous = self._read_state()
         changed = has_changed(previous, payload)
         return payload, changed
 
     def _read_state(self) -> dict[str, Any] | None:
-        """读取 latest.json 中的上次保存状态"""
+        """读取 latest.json 中的上次保存状态（统一入口）"""
         if self.state_path.exists():
             try:
                 return json.loads(self.state_path.read_text(encoding="utf-8"))
             except Exception as e:
-                self.logger.error(f"读取历史状态失败: {e}")
+                self.logger.error(f"读取状态文件失败: {e}")
         return None
 
     def get_cached_payload(self) -> dict[str, Any] | None:
-        """读取缓存的商品数据（供指令快速响应）"""
-        if self.state_path.exists():
-            try:
-                return json.loads(self.state_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                self.logger.warning(f"读取缓存失败: {e}")
-        return None
+        """读取缓存的商品数据（供指令快速响应，委托 _read_state）"""
+        return self._read_state()
 
     # ---------- 消息构建 ----------
 
@@ -294,42 +287,47 @@ class MerchantMonitor:
 
     # ---------- 历史记录 ----------
 
-    async def save_history(self, payload: dict[str, Any]):
-        """保存状态到 latest.json 并追加到 history.jsonl（带去重）"""
+    async def _save_state(self, payload: dict[str, Any]):
+        """只写 latest.json"""
         async with self._file_lock:
-            self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.state_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
-            history_lines = []
+    async def _append_history(self, payload: dict[str, Any]):
+        """追加 history.jsonl（O(1) 仅与末行比对去重，低频滚动清理保持上限 1000 条）"""
+        async with self._file_lock:
+            should_append = True
+            last_line = ""
+
             if self.history_path.exists():
                 try:
                     with self.history_path.open("r", encoding="utf-8") as fp:
-                        history_lines = fp.readlines()
+                        for line in fp:
+                            last_line = line
+                    if last_line:
+                        last_entry = json.loads(last_line.strip())
+                        if comparable_payload(last_entry) == comparable_payload(payload):
+                            self.logger.debug("历史记录已存在相同内容，跳过重复写入")
+                            should_append = False
                 except Exception as e:
                     self.logger.error(f"读取历史记录失败: {e}")
 
-            # 去重：使用 comparable_payload 归一化后，在最近 20 条中检查
-            should_append = True
-            current_comparable = comparable_payload(payload)
-            check_count = min(len(history_lines), 20)
-            for i in range(len(history_lines) - check_count, len(history_lines)):
-                try:
-                    entry = json.loads(history_lines[i])
-                    if comparable_payload(entry) == current_comparable:
-                        should_append = False
-                        self.logger.debug("历史记录已存在相同内容，跳过重复写入")
-                        break
-                except Exception:
-                    continue
-
             if should_append:
-                history_lines.append(json.dumps(payload, ensure_ascii=False) + "\n")
-                history_lines = history_lines[-1000:]
+                new_line = json.dumps(payload, ensure_ascii=False) + "\n"
+                with self.history_path.open("a", encoding="utf-8") as fp:
+                    fp.write(new_line)
 
+                # 低频滚动清理：只在与末行比对时判断是否超限
                 try:
-                    with self.history_path.open("w", encoding="utf-8") as fp:
-                        fp.writelines(history_lines)
+                    line_count = sum(1 for _ in self.history_path.open("r", encoding="utf-8"))
+                    if line_count > 1000:
+                        with self.history_path.open("r", encoding="utf-8") as fp:
+                            lines = fp.readlines()
+                        with self.history_path.open("w", encoding="utf-8") as fp:
+                            fp.writelines(lines[-1000:])
                 except Exception as e:
-                    self.logger.error(f"写入历史记录失败: {e}")
+                    self.logger.error(f"历史记录滚动清理失败: {e}")
 
     def get_history_lines(self) -> list[str]:
         """读取所有历史记录行"""
@@ -342,105 +340,31 @@ class MerchantMonitor:
             self.logger.error(f"读取历史记录失败: {e}")
             return []
 
-    # ---------- 处理与推送 ----------
+    # ---------- 推送 ----------
 
-    async def process_and_push(self, payload: dict[str, Any], send_alert: bool, force_save: bool = False) -> str:
-        """处理抓取结果，保存状态并通过 callback 推送"""
-        current_time = datetime.now(ZoneInfo(self.timezone))
-        previous = self._read_state()
-        changed = has_changed(previous, payload)
-
-        if not changed and previous and "fetched_at" in previous:
-            try:
-                display_time = datetime.fromisoformat(previous["fetched_at"])
-            except Exception:
-                display_time = current_time
-        else:
-            display_time = current_time
-
+    async def _push(self, payload: dict[str, Any], send_alert: bool) -> None:
+        """构建消息并通过 callback 推送"""
+        display_time = datetime.now(ZoneInfo(self.timezone))
         full_text, matched = self.build_message(payload, display_time)
-
-        if changed or force_save:
-            await self.save_history(payload)
-            if send_alert and self.push_callback:
-                await self.push_callback(full_text, matched)
-
-        return full_text
+        if send_alert and self.push_callback:
+            await self.push_callback(full_text, matched)
 
     # ---------- 轮询主循环 ----------
 
     async def poll_loop(self):
-        """后台轮询：在窗口期内定时抓取，数据稳定后推送"""
-        stop_flag_path = self.data_dir / ".stop_flag"
-        
-        while True:
-            # 检查是否已被要求停止
-            if stop_flag_path.exists():
-                self.logger.info("检测到 stop_flag，轮询退出")
-                break
-
+        """精简主循环：窗口检测 → 委托 _handle_window → sleep"""
+        while not self._stopped:
             try:
                 current_time = datetime.now(ZoneInfo(self.timezone))
                 active_slot = self.get_active_slot(current_time)
 
-                if not active_slot:
-                    if self._active_slot is not None:
-                        self.logger.info("窗口期结束，清理轮询状态")
+                if active_slot:
+                    await self._handle_window(active_slot)
+                elif self._active_slot is not None:
+                    self.logger.info("窗口期结束，清理轮询状态")
                     self._active_slot = None
                     self._attempt_count = 0
                     self._last_fetch_result = None
-                else:
-                    if active_slot != self._active_slot:
-                        self._active_slot = active_slot
-                        self._attempt_count = 0
-                        self._last_fetch_result = None
-                        self.logger.info(f"进入新窗口期 {active_slot}，重置轮询状态")
-
-                    flag_path = self._window_flag_path(active_slot)
-                    if flag_path.exists():
-                        self.logger.info(f"{active_slot} 本窗口已推送过，跳过")
-                    elif self._attempt_count < 5:
-                        self._attempt_count += 1
-                        self.logger.info(f"{active_slot} 窗口期第 {self._attempt_count}/5 次抓取检测...")
-
-                        try:
-                            current_payload, _ = await self.execute_fetch_only()
-                        except Exception as fetch_err:
-                            self.logger.warning(f"{active_slot} 第 {self._attempt_count} 次抓取失败: {fetch_err}，等待下次重试")
-                            current_payload = None
-
-                        if current_payload is None:
-                            if self._attempt_count >= 5:
-                                self.logger.warning(
-                                    f"{active_slot} 窗口期内所有抓取均失败，本窗口放弃，等待下一个窗口期"
-                                )
-                        elif self._attempt_count == 1:
-                            self._last_fetch_result = current_payload
-                            self.logger.info(f"{active_slot} 第1次抓取完成，等待下次抓取比对...")
-                        else:
-                            last_result = self._last_fetch_result
-                            if last_result is not None and comparable_payload(last_result) == comparable_payload(current_payload):
-                                # 创建 flag 防止重复推送
-                                self._create_push_flag(flag_path, active_slot)
-                                self.logger.info(f"{active_slot} 连续两次抓取结果一致，触发推送")
-                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                self.logger.info(f"{active_slot} 推送完毕，本窗口期不再继续抓取。")
-                            else:
-                                self._last_fetch_result = current_payload
-                                if last_result is None:
-                                    self.logger.info(f"{active_slot} 第 {self._attempt_count} 次抓取，上次结果丢失，重新建立基准...")
-                                else:
-                                    self.logger.info(f"{active_slot} 第 {self._attempt_count} 次抓取结果与上次不一致，继续比对...")
-
-                            if self._attempt_count >= 5 and not flag_path.exists():
-                                self._create_push_flag(flag_path, active_slot)
-                                self.logger.info(f"{active_slot} 已达到最大检测次数，使用最后一次结果兜底推送")
-                                await self.process_and_push(current_payload, send_alert=True, force_save=True)
-                                self.logger.info(f"{active_slot} 兜底推送完毕，本窗口期不再继续抓取。")
-                    else:
-                        self.logger.info(
-                            f"{active_slot} 已达最大重试次数，本窗口不再重试，等待新窗口"
-                        )
 
             except asyncio.CancelledError:
                 self.logger.info("轮询任务被取消，正常退出")
@@ -450,38 +374,73 @@ class MerchantMonitor:
 
             await asyncio.sleep(120)
 
-    def _create_push_flag(self, flag_path: Path, slot_key: str) -> None:
-        """创建窗口推送标记文件"""
+    async def _handle_window(self, slot: str) -> None:
+        """单窗口连续两次比对完整流程（重置状态 → 5次抓取 → 比对 → 推送 → 熔断兜底）"""
+        if slot != self._active_slot:
+            self._active_slot = slot
+            self._attempt_count = 0
+            self._last_fetch_result = None
+            self.logger.info(f"进入新窗口期 {slot}，重置轮询状态")
+
+        if self._is_window_pushed(slot):
+            self.logger.info(f"{slot} 本窗口已推送过，跳过")
+            return
+        if self._attempt_count >= 5:
+            self.logger.info(f"{slot} 已达最大重试次数，等待新窗口")
+            return
+
+        self._attempt_count += 1
+        self.logger.info(f"{slot} 窗口期第 {self._attempt_count}/5 次抓取检测...")
+
         try:
-            flag_path.write_text(json.dumps({
-                "slot": slot_key,
-                "pushed_at": datetime.now(ZoneInfo(self.timezone)).isoformat()
-            }, ensure_ascii=False), encoding="utf-8")
+            payload = await self.fetch()
         except Exception as e:
-            self.logger.warning(f"创建推送标记文件失败: {e}")
+            self.logger.warning(f"{slot} 第 {self._attempt_count} 次抓取失败: {e}")
+            if self._attempt_count >= 5:
+                self.logger.warning(f"{slot} 窗口期内所有抓取均失败，本窗口放弃")
+                # 标记已尽力，避免后续轮询空转
+                self._mark_window_pushed(slot)
+            return
+
+        last = self._last_fetch_result
+        matched = last is not None and comparable_payload(last) == comparable_payload(payload)
+
+        if matched:
+            # 连续两次抓取结果一致 → 推送
+            self.logger.info(f"{slot} 连续两次抓取结果一致，触发推送")
+            await self._save_state(payload)
+            await self._append_history(payload)
+            await self._push(payload, send_alert=True)
+            # 先持久化再标记，避免中间异常导致窗口被标记但数据丢失
+            self._mark_window_pushed(slot)
+            self.logger.info(f"{slot} 推送完毕，本窗口期不再继续抓取。")
+        elif self._attempt_count >= 5:
+            # 兜底：已达最大次数，使用最后一次结果推送
+            self.logger.info(f"{slot} 已达最大检测次数，使用最后一次结果兜底推送")
+            await self._save_state(payload)
+            await self._append_history(payload)
+            await self._push(payload, send_alert=True)
+            self._mark_window_pushed(slot)
+            self.logger.info(f"{slot} 兜底推送完毕，本窗口期不再继续抓取。")
+        else:
+            self._last_fetch_result = payload
+            if last is None:
+                self.logger.info(f"{slot} 第 {self._attempt_count} 次抓取完成，等待下次抓取比对...")
+            else:
+                self.logger.info(f"{slot} 第 {self._attempt_count} 次抓取结果与上次不一致，继续比对...")
 
     # ---------- 生命周期 ----------
 
     async def stop(self):
         """停止轮询并释放资源"""
-        # 写入 stop_flag 通知 poll_loop 退出
-        stop_flag_path = self.data_dir / ".stop_flag"
-        try:
-            stop_flag_path.write_text("1", encoding="utf-8")
-        except Exception:
-            pass
+        self._stopped = True
 
         if hasattr(self, "_polling_task") and not self._polling_task.done():
             self._polling_task.cancel()
             try:
-                await self._polling_task
-            except asyncio.CancelledError:
+                # 超时保护：避免 poll_loop 阻塞在 asyncio.to_thread 中影响框架重载
+                await asyncio.wait_for(self._polling_task, timeout=10)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
-        # 清理 stop_flag
-        try:
-            stop_flag_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-        self.logger.info("轮询任务已取消，Monitor 已停止")
+        self.logger.info("Monitor 已停止")

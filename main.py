@@ -32,7 +32,7 @@ from merchant import MerchantMonitor, setup_file_logger
     "astrbot_plugin_rock_merchant_notify",
     "AstrBot",
     "远行商人监控插件",
-    "1.4.0",
+    "1.4.3",
     "支持不同群聊独立配置推送模式及艾特规则",
 )
 class MerchantNotifyPlugin(Star):
@@ -244,7 +244,7 @@ class MerchantNotifyPlugin(Star):
 
             if payload is None:
                 # 无缓存，实时抓取
-                payload, _ = await self.monitor.execute_fetch_only()
+                payload = await self.monitor.fetch()
 
             try:
                 display_time = datetime.fromisoformat(payload.get("fetched_at", ""))
